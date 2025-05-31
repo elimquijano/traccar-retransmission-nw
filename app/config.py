@@ -1,28 +1,43 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv() # Carga variables desde .env
+load_dotenv()
 
-# Traccar Configuration
-TRACCAR_URL = os.getenv("TRACCAR_URL", "http://127.0.0.1:8082")
-TRACCAR_EMAIL = os.getenv("TRACCAR_EMAIL", "user@gmail.com")
-TRACCAR_PASSWORD = os.getenv("TRACCAR_PASSWORD", "")
+# --- General Application ---
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+TIMEZONE_SYSTEM = os.getenv("TIMEZONE_SYSTEM", "America/Lima")
 
-# Database Configuration
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "127.0.0.1"),
-    "user": os.getenv("DB_USER", "user"),
-    "password": os.getenv("DB_PASSWORD", "password"),
-    "database": os.getenv("DB_NAME", "db"),
+# --- Traccar Configuration ---
+TRACCAR_URL = os.getenv("TRACCAR_URL")
+TRACCAR_EMAIL = os.getenv("TRACCAR_EMAIL")
+TRACCAR_PASSWORD = os.getenv("TRACCAR_PASSWORD")
+
+# --- Database for Retransmission Configuration AND LOGS (BD1) ---
+DB_CONN_PARAMS = {  # Renombrado para uso general, ya que es la única BD
+    "host": os.getenv("DB_CONFIG_HOST"),
+    "user": os.getenv("DB_CONFIG_USER"),
+    "password": os.getenv("DB_CONFIG_PASSWORD"),
+    "database": os.getenv("DB_CONFIG_NAME"),
 }
+# Optional pooling parameters for mysql.connector
+# Usaremos el prefijo DB_CONFIG_ para estas variables de entorno por consistencia histórica.
+if os.getenv("DB_CONFIG_POOL_NAME"):
+    DB_CONN_PARAMS["pool_name"] = os.getenv("DB_CONFIG_POOL_NAME")
+    DB_CONN_PARAMS["pool_size"] = int(os.getenv("DB_CONFIG_POOL_SIZE", 5))
 
-# Retransmission Settings
+# --- Retransmission Settings ---
 RETRANSMIT_INTERVAL_SECONDS = int(os.getenv("RETRANSMIT_INTERVAL_SECONDS", 2))
 MAX_QUEUE_SIZE_BEFORE_WARN = int(os.getenv("MAX_QUEUE_SIZE_BEFORE_WARN", 1000))
 MAX_PROCESSED_IDS_SIZE = int(os.getenv("MAX_PROCESSED_IDS_SIZE", 10000))
-# Esta URL es un fallback, la configuración de la BD tiene prioridad
-DEFAULT_TARGET_RETRANSMIT_URL = os.getenv("TARGET_RETRANSMIT_URL", "http://127.0.0.1:5000/api/receive_position")
 DATETIME_OFFSET_HOURS = int(os.getenv("DATETIME_OFFSET_HOURS", -5))
+
+# URLs para identificar tipos de retransmisión y mapearlas a un ID de handler
+RETRANSMISSION_HANDLER_MAP = {
+    os.getenv("RETRANSMISSION_URL_SEGURIDAD_CIUDADANA"): "seguridad_ciudadana",
+    os.getenv("RETRANSMISSION_URL_OTRO_TIPO"): "otro_tipo",
+    # os.getenv("RETRANSMISSION_URL_UN_TERCER_TIPO"): "un_tercer_tipo",
+}
+RETRANSMISSION_HANDLER_MAP = {k: v for k, v in RETRANSMISSION_HANDLER_MAP.items() if k}
 
 
 # WebSocket Settings
@@ -31,5 +46,31 @@ WS_PING_TIMEOUT_SECONDS = 10
 RECONNECT_DELAY_SECONDS = 10
 INITIAL_LOAD_RETRY_DELAY_SECONDS = 30
 
-# Logging
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# Log Writer DB Settings
+# LOG_WRITER_DB_ENABLED se basará en si DB_CONN_PARAMS está completo.
+LOG_WRITER_DB_ENABLED = all(
+    DB_CONN_PARAMS.get(k) for k in ["host", "user", "password", "database"]
+)
+LOG_WRITER_QUEUE_MAX_SIZE = int(os.getenv("LOG_WRITER_QUEUE_MAX_SIZE", 5000))
+LOG_WRITER_BATCH_SIZE = int(os.getenv("LOG_WRITER_BATCH_SIZE", 100))
+LOG_WRITER_FLUSH_INTERVAL_SECONDS = int(
+    os.getenv("LOG_WRITER_FLUSH_INTERVAL_SECONDS", 5)
+)
+
+# Validate critical configurations
+if not TRACCAR_URL or not TRACCAR_EMAIL or not TRACCAR_PASSWORD:
+    raise ValueError("Traccar URL, Email, or Password not configured in .env")
+
+if (
+    not LOG_WRITER_DB_ENABLED
+):  # Chequea si la configuración de la BD principal está completa
+    print(
+        "WARNING: Database connection parameters (DB_CONFIG_*) are incomplete. Database logging will be disabled."
+    )
+    # La aplicación puede continuar sin logueo a BD si esto no es crítico.
+    # Si es crítico, podrías lanzar un ValueError aquí.
+
+if not RETRANSMISSION_HANDLER_MAP:
+    print(
+        "WARNING: No RETRANSMISSION_URL_* variables are set in .env. No retransmission handlers will be mapped."
+    )

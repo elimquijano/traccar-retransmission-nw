@@ -3,5 +3,7 @@ __pycache__/
 .env
 venv/
 *.log
+*.sqlite3
+*.db
 
 api.py

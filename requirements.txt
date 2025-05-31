@@ -2,3 +2,4 @@ requests
 websocket-client
 mysql-connector-python
 python-dotenv
+pytz

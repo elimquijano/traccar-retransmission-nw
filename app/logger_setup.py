@@ -1,28 +1,24 @@
 import logging
 import sys
-from app.config import LOG_LEVEL
+from app.config import LOG_LEVEL # Asegúrate que config.py exista y LOG_LEVEL esté definido
 
 def setup_logging():
     """Configures the root logger."""
-    log_format = "%(asctime)s - %(levelname)s - %(name)s - %(filename)s:%(lineno)d - %(message)s"
+    log_format = "%(asctime)s - %(levelname)s - [%(threadName)s] - %(name)s - %(filename)s:%(lineno)d - %(message)s"
     logging.basicConfig(
         level=LOG_LEVEL,
         format=log_format,
         handlers=[
             logging.StreamHandler(sys.stdout)
-            # Puedes añadir FileHandler si quieres guardar logs en archivos
-            # logging.FileHandler("retransmitter.log")
+            # logging.FileHandler("retransmitter.log", mode='a') # Opcional: log a archivo
         ]
     )
     # Silenciar logs de librerías muy verbosas si es necesario
-    # logging.getLogger("requests").setLevel(logging.WARNING)
-    # logging.getLogger("urllib3").setLevel(logging.WARNING)
-    # logging.getLogger("websocket").setLevel(logging.WARNING) # O INFO para ver sus mensajes
+    logging.getLogger("requests").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("websocket").setLevel(logging.INFO) # O WARNING si es mucho
 
-    logger = logging.getLogger(__name__)
-    logger.info("Logging configured.")
-    return logger
-
-# Configura el logger al importar el módulo para que esté disponible globalmente
-# si se desea, aunque es mejor obtener el logger específico en cada módulo.
-# setup_logging()
+    # Obtener un logger para este módulo y loguear que la configuración se ha aplicado
+    logger = logging.getLogger(__name__) # Obtiene un logger con el nombre del módulo actual
+    logger.info(f"Root logger configured with level: {LOG_LEVEL}")
+    return logger # Devuelve el logger de este módulo, pero la configuración es global
