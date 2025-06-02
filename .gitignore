@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .env
 venv/
+logs/
 *.log
 *.sqlite3
 *.db

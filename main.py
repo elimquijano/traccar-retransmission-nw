@@ -2,7 +2,7 @@ import logging
 import time
 import threading
 import signal
-import os  # Para PID
+import os
 
 from app.logger_setup import setup_logging
 
@@ -11,11 +11,13 @@ logger = setup_logging()
 from app.config import (
     RECONNECT_DELAY_SECONDS,
     INITIAL_LOAD_RETRY_DELAY_SECONDS,
-    LOG_WRITER_DB_ENABLED,  # Usar esta variable
+    LOG_WRITER_DB_ENABLED,
 )
 from app.traccar_client import TraccarClient
 from app.services.retransmission_manager import RetransmissionManager
 from app.persistence.db_config_loader import load_retransmission_configs_from_db1
+
+# Importa la instancia singleton de LogWriterDB
 from app.persistence.log_writer_db import log_writer_db_instance
 
 global_shutdown_event = threading.Event()
@@ -49,8 +51,40 @@ def on_traccar_ws_error(ws_app_instance, error):
 def run_application():
     logger.info("Application core starting...")
 
-    retransmission_mgr = RetransmissionManager()
+    # --- Procesar logs pendientes del archivo de respaldo ANTES de iniciar la lógica principal ---
+    if LOG_WRITER_DB_ENABLED and log_writer_db_instance:
+        logger.info("Checking for pending logs from previous runs...")
+        try:
+            # log_writer_db_instance es un singleton, ya está inicializado si LOG_WRITER_DB_ENABLED es True.
+            # Su worker thread también ya habrá comenzado.
+            # La lógica en process_pending_logs_from_backup debe ser segura
+            # incluso si el worker está activo (ej. renombrando el archivo de backup).
+            all_pending_processed_ok = (
+                log_writer_db_instance.process_pending_logs_from_backup()
+            )
+            if not all_pending_processed_ok:
+                logger.warning(
+                    "Not all pending logs from backup were processed successfully. Check previous errors."
+                )
+            else:
+                logger.info(
+                    "Pending log processing from backup file complete (if any)."
+                )
+        except Exception as e:
+            logger.error(
+                f"Error during initial pending log processing: {e}", exc_info=True
+            )
+    elif LOG_WRITER_DB_ENABLED and not log_writer_db_instance:
+        logger.error(
+            "LOG_WRITER_DB_ENABLED is true, but log_writer_db_instance is None. Cannot process pending logs."
+        )
+    else:  # LOG_WRITER_DB_ENABLED is False
+        logger.info(
+            "Database logging (and pending log processing) is disabled via config."
+        )
+    # --- FIN DE PROCESAMIENTO DE LOGS PENDIENTES ---
 
+    retransmission_mgr = RetransmissionManager()
     traccar_cli = TraccarClient(
         message_callback=retransmission_mgr.handle_traccar_websocket_message,
         open_callback=on_traccar_ws_open,
@@ -103,12 +137,11 @@ def run_application():
 
             if global_shutdown_event.is_set():
                 logger.info(
-                    "Shutdown signaled while WebSocket was active or attempting connection. Exiting loop."
+                    "Shutdown signaled while WebSocket was active. Exiting loop."
                 )
                 break
-
             logger.warning(
-                "Traccar WebSocket run_forever exited. Will attempt to reconnect if not shutting down."
+                "Traccar WebSocket run_forever exited. Attempting reconnect cycle."
             )
 
         except Exception as e:
@@ -117,27 +150,27 @@ def run_application():
             )
             if global_shutdown_event.is_set():
                 break
-            time.sleep(RECONNECT_DELAY_SECONDS)
+            # Esperar antes de reintentar todo el ciclo
+            if global_shutdown_event.wait(RECONNECT_DELAY_SECONDS):
+                break
 
         if global_shutdown_event.is_set():
             break
-
         logger.info(
-            f"Waiting {RECONNECT_DELAY_SECONDS}s before attempting Traccar reconnection cycle..."
+            f"Waiting {RECONNECT_DELAY_SECONDS}s before Traccar reconnection cycle..."
         )
         if global_shutdown_event.wait(RECONNECT_DELAY_SECONDS):
             break
 
     logger.info("Application run loop has finished or been interrupted.")
-
     logger.info("Initiating shutdown of application services...")
 
-    retransmission_mgr.stop_retransmission_worker()
+    if retransmission_mgr:  # Si se instanció
+        retransmission_mgr.stop_retransmission_worker()
 
-    if traccar_cli:
+    if traccar_cli:  # Si se instanció
         traccar_cli.close_websocket()
 
-    # Usar LOG_WRITER_DB_ENABLED de config.py
     if LOG_WRITER_DB_ENABLED and log_writer_db_instance:
         log_writer_db_instance.shutdown()
 
@@ -146,7 +179,6 @@ def run_application():
 
 if __name__ == "__main__":
     logger.info(f"Starting Traccar Retransmitter Application (PID: {os.getpid()})...")
-
     signal.signal(signal.SIGINT, os_signal_handler)
     signal.signal(signal.SIGTERM, os_signal_handler)
 
@@ -162,34 +194,30 @@ if __name__ == "__main__":
                 logger.debug("__main__: App thread finished after shutdown signal.")
                 break
     except KeyboardInterrupt:
-        logger.info(
-            "KeyboardInterrupt caught in __main__ block. Ensuring shutdown is signaled..."
-        )
+        logger.info("KeyboardInterrupt in __main__. Ensuring shutdown...")
         if not global_shutdown_event.is_set():
             global_shutdown_event.set()
     except Exception as e:
-        logger.critical(
-            f"Unhandled exception in __main__ execution block: {e}", exc_info=True
-        )
+        logger.critical(f"Unhandled exception in __main__: {e}", exc_info=True)
         if not global_shutdown_event.is_set():
             global_shutdown_event.set()
     finally:
         logger.info("Main (__main__) thread: Initiating final cleanup...")
-
         if main_app_thread.is_alive():
             logger.info(
-                "Main (__main__) thread: Waiting for application service thread to complete shutdown..."
+                "Main (__main__) thread: Waiting for app service thread to complete shutdown..."
             )
-            main_app_thread.join(timeout=15)
+            main_app_thread.join(timeout=15)  # Dar tiempo para el shutdown
 
         if main_app_thread.is_alive():
             logger.warning(
-                "Main application service thread (MainAppServiceThread) did not shut down cleanly after timeout."
+                "Main app service thread did not shut down cleanly after timeout."
             )
         else:
-            logger.info(
-                "Main application service thread (MainAppServiceThread) has finished."
-            )
+            logger.info("Main app service thread has finished.")
 
+        # Asegurarse que todos los handlers de logging se cierren y flusheen
         logging.shutdown()
-        logger.info("Program finalized.")
+        print(
+            "Program finalized."
+        )  # Un print final para saber que terminó si los logs no se ven

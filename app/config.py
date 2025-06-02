@@ -6,6 +6,7 @@ load_dotenv()
 # --- General Application ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TIMEZONE_SYSTEM = os.getenv("TIMEZONE_SYSTEM", "America/Lima")
+LOGS_DIR_NAME = "logs"  # Nombre de la carpeta de logs en la raíz del proyecto (usado por logger_setup y log_writer_db)
 
 # --- Traccar Configuration ---
 TRACCAR_URL = os.getenv("TRACCAR_URL")
@@ -19,23 +20,21 @@ DB_CONN_PARAMS = {
     "password": os.getenv("DB_CONFIG_PASSWORD"),
     "database": os.getenv("DB_CONFIG_NAME"),
 }
-if os.getenv("DB_CONFIG_POOL_NAME"):  # Opcional: nombre del pool si se usa
+if os.getenv("DB_CONFIG_POOL_NAME"):
     DB_CONN_PARAMS["pool_name"] = os.getenv("DB_CONFIG_POOL_NAME")
     DB_CONN_PARAMS["pool_size"] = int(os.getenv("DB_CONFIG_POOL_SIZE", 5))
 
 # --- Retransmission Settings ---
-RETRANSMIT_INTERVAL_SECONDS = int(
-    os.getenv("RETRANSMIT_INTERVAL_SECONDS", 2)
-)  # Intervalo general del worker si la cola está vacía
+RETRANSMIT_INTERVAL_SECONDS = int(os.getenv("RETRANSMIT_INTERVAL_SECONDS", 2))
 MAX_QUEUE_SIZE_BEFORE_WARN = int(os.getenv("MAX_QUEUE_SIZE_BEFORE_WARN", 1000))
 MAX_PROCESSED_IDS_SIZE = int(os.getenv("MAX_PROCESSED_IDS_SIZE", 10000))
 DATETIME_OFFSET_HOURS = int(os.getenv("DATETIME_OFFSET_HOURS", -5))
 
-# --- Retransmission Worker Attempt Settings (NUEVO) ---
+# --- Retransmission Worker Attempt Settings ---
 MAX_RETRANSMISSION_ATTEMPTS = int(os.getenv("MAX_RETRANSMISSION_ATTEMPTS", 5))
 RETRANSMISSION_RETRY_DELAY_SECONDS = float(
     os.getenv("RETRANSMISSION_RETRY_DELAY_SECONDS", 0.5)
-)  # Puede ser float
+)
 
 # URLs para identificar tipos de retransmisión
 RETRANSMISSION_HANDLER_MAP = {
@@ -61,14 +60,25 @@ LOG_WRITER_FLUSH_INTERVAL_SECONDS = int(
     os.getenv("LOG_WRITER_FLUSH_INTERVAL_SECONDS", 5)
 )
 
+# --- DB Log Backup Settings (NUEVO) ---
+DB_LOG_BACKUP_FILE_PATH = os.path.join(
+    LOGS_DIR_NAME, os.getenv("DB_LOG_BACKUP_FILENAME", "pending_db_logs.jsonl")
+)
+MAX_DB_CONNECTION_FAILURES_BEFORE_BACKUP = int(
+    os.getenv("MAX_DB_CONNECTION_FAILURES_BEFORE_BACKUP", 3)
+)
+
+
 # Validate critical configurations
 if not TRACCAR_URL or not TRACCAR_EMAIL or not TRACCAR_PASSWORD:
     raise ValueError("Traccar URL, Email, or Password not configured in .env")
 
-if not LOG_WRITER_DB_ENABLED:
+if not LOG_WRITER_DB_ENABLED:  # Basado en DB_CONN_PARAMS
     print(
-        "WARNING: Database connection parameters (DB_CONFIG_*) are incomplete. Database logging will be disabled."
+        f"WARNING: Database connection parameters (DB_CONFIG_*) are incomplete. "
+        f"Database logging (and pending log processing) will be disabled. Backup file: {DB_LOG_BACKUP_FILE_PATH}"
     )
+    # La aplicación puede continuar, pero sin logging a BD ni procesamiento de pendientes.
 
 if not RETRANSMISSION_HANDLER_MAP:
     print(
