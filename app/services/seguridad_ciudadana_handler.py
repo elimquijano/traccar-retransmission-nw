@@ -53,9 +53,7 @@ class SeguridadCiudadanaHandler(BaseRetransmissionHandler):
             "distancia": round(distancia_actual_mts, 2),
             "fechaHora": fecha_hora_final,
             "horasMotor": 0.0,  # This field was always 0.0 in original code, confirm if still needed
-            "idMunicipalidad": str(
-                retrans_config_for_device.get("id_municipalidad", "")
-            ),
+            "idMunicipalidad": str(retrans_config_for_device.get("id_municipalidad", "")),
             "ignition": bool(attributes.get("ignition", False)),
             "imei": str(retrans_config_for_device.get("imei", "")),
             "latitud": float(traccar_position.get("latitude", 0.0)),

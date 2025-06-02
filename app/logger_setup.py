@@ -4,7 +4,7 @@ from app.config import LOG_LEVEL # Asegúrate que config.py exista y LOG_LEVEL e
 
 def setup_logging():
     """Configures the root logger."""
-    log_format = "%(asctime)s - %(levelname)s - [%(threadName)s] - %(name)s - %(filename)s:%(lineno)d - %(message)s"
+    log_format = "%(asctime)s - %(levelname)s - %(name)s:%(lineno)d - %(message)s"
     logging.basicConfig(
         level=LOG_LEVEL,
         format=log_format,
@@ -20,5 +20,5 @@ def setup_logging():
 
     # Obtener un logger para este módulo y loguear que la configuración se ha aplicado
     logger = logging.getLogger(__name__) # Obtiene un logger con el nombre del módulo actual
-    logger.info(f"Root logger configured with level: {LOG_LEVEL}")
+    logger.info(f"Registrador raíz configurado con nivel: {LOG_LEVEL}")
     return logger # Devuelve el logger de este módulo, pero la configuración es global
