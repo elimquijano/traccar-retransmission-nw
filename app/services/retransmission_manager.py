@@ -582,11 +582,6 @@ class RetransmissionManager:
             )
             return False, "Sesión AIOHTTP cerrada", None
 
-        # Configuramos el contexto SSL usando certifi
-        import ssl
-
-        ssl_context_with_certifi = ssl.create_default_context(cafile=certifi.where())
-
         try:
             logger.debug(
                 f"POST AIOHTTP (intento {attempt_num}) a {target_url} para posición {pos_id_display} (placa {placa_for_log}) con headers {http_headers}"
@@ -594,10 +589,7 @@ class RetransmissionManager:
 
             # Ejecutamos la solicitud POST
             async with self._aiohttp_session.post(
-                target_url,
-                data=json_payload_str,
-                headers=http_headers,
-                ssl=ssl_context_with_certifi,  # Usamos certifi para verificación SSL
+                target_url, data=json_payload_str, headers=http_headers, ssl=False
             ) as response:
                 status_code = response.status
 
