@@ -1,5 +1,6 @@
+# main.py
 import logging
-import time
+import asyncio
 import threading
 import signal
 import os
@@ -16,8 +17,6 @@ from app.config import (
 from app.traccar_client import TraccarClient
 from app.services.retransmission_manager import RetransmissionManager
 from app.persistence.db_config_loader import load_retransmission_configs_from_db1
-
-# Importa la instancia singleton de LogWriterDB
 from app.persistence.log_writer_db import log_writer_db_instance
 
 global_shutdown_event = threading.Event()
@@ -32,6 +31,9 @@ def os_signal_handler(signum, frame):
     logger.info(f"{signal_name} received. Initiating graceful shutdown...")
     if not global_shutdown_event.is_set():
         global_shutdown_event.set()
+        # Intentar cancelar la tarea principal de asyncio si está corriendo
+        # Esto es un poco más complejo porque el loop puede no estar accesible directamente aquí
+        # La tarea asyncio principal debe chequear global_shutdown_event.
 
 
 def on_traccar_ws_open(ws_app_instance):
@@ -48,43 +50,18 @@ def on_traccar_ws_error(ws_app_instance, error):
     logger.error(f"Callback: Received error from Traccar WebSocket: {error}")
 
 
-def run_application():
-    logger.info("Application core starting...")
+async def run_application_async(loop: asyncio.AbstractEventLoop):  # Aceptar el loop
+    logger.info("Async Application core starting...")
 
-    # --- Procesar logs pendientes del archivo de respaldo ANTES de iniciar la lógica principal ---
     if LOG_WRITER_DB_ENABLED and log_writer_db_instance:
         logger.info("Checking for pending logs from previous runs...")
         try:
-            # log_writer_db_instance es un singleton, ya está inicializado si LOG_WRITER_DB_ENABLED es True.
-            # Su worker thread también ya habrá comenzado.
-            # La lógica en process_pending_logs_from_backup debe ser segura
-            # incluso si el worker está activo (ej. renombrando el archivo de backup).
-            all_pending_processed_ok = (
-                log_writer_db_instance.process_pending_logs_from_backup()
-            )
-            if not all_pending_processed_ok:
-                logger.warning(
-                    "Not all pending logs from backup were processed successfully. Check previous errors."
-                )
-            else:
-                logger.info(
-                    "Pending log processing from backup file complete (if any)."
-                )
-        except Exception as e:
-            logger.error(
-                f"Error during initial pending log processing: {e}", exc_info=True
-            )
-    elif LOG_WRITER_DB_ENABLED and not log_writer_db_instance:
-        logger.error(
-            "LOG_WRITER_DB_ENABLED is true, but log_writer_db_instance is None. Cannot process pending logs."
-        )
-    else:  # LOG_WRITER_DB_ENABLED is False
-        logger.info(
-            "Database logging (and pending log processing) is disabled via config."
-        )
-    # --- FIN DE PROCESAMIENTO DE LOGS PENDIENTES ---
+            log_writer_db_instance.process_pending_logs_from_backup()
+        except Exception as e_backup:
+            logger.error(f"Error processing backup logs: {e_backup}", exc_info=True)
 
-    retransmission_mgr = RetransmissionManager()
+    retransmission_mgr = RetransmissionManager(loop=loop)  # <--- PASAR EL LOOP
+
     traccar_cli = TraccarClient(
         message_callback=retransmission_mgr.handle_traccar_websocket_message,
         open_callback=on_traccar_ws_open,
@@ -92,132 +69,213 @@ def run_application():
         error_callback=on_traccar_ws_error,
     )
     retransmission_mgr.set_traccar_client(traccar_cli)
-    retransmission_mgr.start_retransmission_worker()
+    await retransmission_mgr.start_retransmission_worker_async()
 
-    while not global_shutdown_event.is_set():
-        try:
-            if not traccar_cli.session_cookies:
-                logger.info("Attempting Traccar login...")
-                if not traccar_cli.login():
-                    logger.error(
-                        f"Traccar login failed. Retrying in {INITIAL_LOAD_RETRY_DELAY_SECONDS}s..."
+    traccar_logic_thread_stop_event = threading.Event()
+
+    def traccar_sync_operations_loop():
+        logger.info("Traccar sync operations loop thread started.")
+        while (
+            not global_shutdown_event.is_set()
+            and not traccar_logic_thread_stop_event.is_set()
+        ):
+            try:
+                if not traccar_cli.session_cookies:
+                    logger.info("Attempting Traccar login (from sync thread)...")
+                    if not traccar_cli.login():
+                        logger.error(
+                            f"Traccar login failed. Retrying in {INITIAL_LOAD_RETRY_DELAY_SECONDS}s..."
+                        )
+                        if (
+                            global_shutdown_event.wait(INITIAL_LOAD_RETRY_DELAY_SECONDS)
+                            or traccar_logic_thread_stop_event.is_set()
+                        ):
+                            break  # Salir si se detiene
+                        continue
+
+                if not traccar_cli.traccar_devices_cache:
+                    logger.info("Fetching Traccar devices (from sync thread)...")
+                    if not traccar_cli.fetch_devices():
+                        logger.error(
+                            f"Failed to fetch Traccar devices. Retrying in {INITIAL_LOAD_RETRY_DELAY_SECONDS}s..."
+                        )
+                        if (
+                            global_shutdown_event.wait(INITIAL_LOAD_RETRY_DELAY_SECONDS)
+                            or traccar_logic_thread_stop_event.is_set()
+                        ):
+                            break
+                        continue
+
+                if not retransmission_mgr.retransmission_configs_db1:
+                    logger.info(
+                        "Loading retransmission configurations from DB (from sync thread)..."
                     )
-                    if global_shutdown_event.wait(INITIAL_LOAD_RETRY_DELAY_SECONDS):
-                        break
-                    continue
+                    current_db1_configs = load_retransmission_configs_from_db1()
+                    if current_db1_configs is not None:
+                        retransmission_mgr.update_retransmission_configs_from_db1(
+                            current_db1_configs
+                        )
+                    else:
+                        logger.error(
+                            f"Failed to fetch retransmission configs. Retrying in {INITIAL_LOAD_RETRY_DELAY_SECONDS}s..."
+                        )
+                        if (
+                            global_shutdown_event.wait(INITIAL_LOAD_RETRY_DELAY_SECONDS)
+                            or traccar_logic_thread_stop_event.is_set()
+                        ):
+                            break
+                        continue
 
-            if not traccar_cli.traccar_devices_cache:
-                logger.info("Fetching Traccar devices...")
-                if not traccar_cli.fetch_devices():
-                    logger.error(
-                        f"Failed to fetch Traccar devices. Retrying in {INITIAL_LOAD_RETRY_DELAY_SECONDS}s..."
-                    )
-                    if global_shutdown_event.wait(INITIAL_LOAD_RETRY_DELAY_SECONDS):
-                        break
-                    continue
-
-            if not retransmission_mgr.retransmission_configs_db1:
-                logger.info("Loading retransmission configurations from DB...")
-                current_db1_configs = load_retransmission_configs_from_db1()
-                if current_db1_configs is None:
-                    logger.error(
-                        f"Failed to fetch retransmission configs from DB. Retrying in {INITIAL_LOAD_RETRY_DELAY_SECONDS}s..."
-                    )
-                    if global_shutdown_event.wait(INITIAL_LOAD_RETRY_DELAY_SECONDS):
-                        break
-                    continue
-                retransmission_mgr.update_retransmission_configs_from_db1(
-                    current_db1_configs
-                )
-
-            logger.info(
-                "Attempting to establish and run Traccar WebSocket connection..."
-            )
-            traccar_cli.connect_websocket()
-
-            if global_shutdown_event.is_set():
                 logger.info(
-                    "Shutdown signaled while WebSocket was active. Exiting loop."
+                    "Attempting Traccar WebSocket connection (from sync thread)..."
                 )
-                break
-            logger.warning(
-                "Traccar WebSocket run_forever exited. Attempting reconnect cycle."
-            )
+                traccar_cli.connect_websocket()
 
-        except Exception as e:
-            logger.critical(
-                f"Unhandled exception in main application loop: {e}", exc_info=True
-            )
-            if global_shutdown_event.is_set():
-                break
-            # Esperar antes de reintentar todo el ciclo
-            if global_shutdown_event.wait(RECONNECT_DELAY_SECONDS):
-                break
+                if (
+                    global_shutdown_event.is_set()
+                    or traccar_logic_thread_stop_event.is_set()
+                ):
+                    break
+                logger.warning(
+                    "Traccar WebSocket disconnected. Reconnecting in sync loop..."
+                )
+                if (
+                    global_shutdown_event.wait(RECONNECT_DELAY_SECONDS)
+                    or traccar_logic_thread_stop_event.is_set()
+                ):
+                    break
 
-        if global_shutdown_event.is_set():
-            break
+            except Exception as e_sync:
+                logger.critical(
+                    f"Exception in Traccar sync operations loop: {e_sync}",
+                    exc_info=True,
+                )
+                if (
+                    global_shutdown_event.is_set()
+                    or traccar_logic_thread_stop_event.is_set()
+                ):
+                    break
+                if (
+                    global_shutdown_event.wait(RECONNECT_DELAY_SECONDS)
+                    or traccar_logic_thread_stop_event.is_set()
+                ):
+                    break
+        logger.info("Traccar sync operations loop thread finished.")
+
+    traccar_thread = threading.Thread(
+        target=traccar_sync_operations_loop, name="TraccarSyncThread", daemon=True
+    )
+    traccar_thread.start()
+
+    try:
+        while not global_shutdown_event.is_set():
+            await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        logger.info("run_application_async was cancelled.")
+    finally:
+        logger.info("Async Application run loop has finished or been interrupted.")
+        logger.info("Initiating shutdown of application services...")
+
+        logger.info("Signaling Traccar sync operations loop to stop...")
+        traccar_logic_thread_stop_event.set()
+        if traccar_cli:
+            traccar_cli.close_websocket()
+        if traccar_thread.is_alive():
+            logger.info("Waiting for Traccar sync thread to join...")
+            traccar_thread.join(timeout=RECONNECT_DELAY_SECONDS + 5)
+            if traccar_thread.is_alive():
+                logger.warning("Traccar sync thread did not join cleanly.")
+            else:
+                logger.info("Traccar sync thread joined.")
+
+        if retransmission_mgr:
+            await retransmission_mgr.stop_retransmission_worker_async()
+
+        if LOG_WRITER_DB_ENABLED and log_writer_db_instance:
+            logger.info("Requesting LogWriterDB shutdown...")
+            log_writer_db_instance.shutdown()
+            logger.info("LogWriterDB shutdown sequence completed by main app.")
+
         logger.info(
-            f"Waiting {RECONNECT_DELAY_SECONDS}s before Traccar reconnection cycle..."
+            "All application services have been signaled to stop or completed shutdown."
         )
-        if global_shutdown_event.wait(RECONNECT_DELAY_SECONDS):
-            break
-
-    logger.info("Application run loop has finished or been interrupted.")
-    logger.info("Initiating shutdown of application services...")
-
-    if retransmission_mgr:  # Si se instanció
-        retransmission_mgr.stop_retransmission_worker()
-
-    if traccar_cli:  # Si se instanció
-        traccar_cli.close_websocket()
-
-    if LOG_WRITER_DB_ENABLED and log_writer_db_instance:
-        log_writer_db_instance.shutdown()
-
-    logger.info("All application services have been signaled to stop.")
 
 
 if __name__ == "__main__":
     logger.info(f"Starting Traccar Retransmitter Application (PID: {os.getpid()})...")
+
     signal.signal(signal.SIGINT, os_signal_handler)
     signal.signal(signal.SIGTERM, os_signal_handler)
 
-    main_app_thread = threading.Thread(
-        target=run_application, name="MainAppServiceThread"
-    )
-    main_app_thread.start()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # Pasar el loop a run_application_async
+    main_task = loop.create_task(run_application_async(loop))  # <--- PASAR EL LOOP
 
     try:
-        while main_app_thread.is_alive():
-            main_app_thread.join(timeout=1.0)
-            if global_shutdown_event.is_set() and not main_app_thread.is_alive():
-                logger.debug("__main__: App thread finished after shutdown signal.")
-                break
+        loop.run_until_complete(main_task)
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt in __main__. Ensuring shutdown...")
+        logger.info(
+            "KeyboardInterrupt received in __main__ (asyncio). Signaling shutdown..."
+        )
         if not global_shutdown_event.is_set():
             global_shutdown_event.set()
-    except Exception as e:
-        logger.critical(f"Unhandled exception in __main__: {e}", exc_info=True)
+        if not main_task.done():
+            logger.info("Cancelling main application task...")
+            main_task.cancel()
+            try:
+                loop.run_until_complete(main_task)
+            except asyncio.CancelledError:
+                logger.info("Main application task successfully cancelled.")
+            except Exception as e_final_cancel:
+                logger.error(
+                    f"Exception during main task cancellation: {e_final_cancel}"
+                )
+    except Exception as e_main_async:
+        logger.critical(
+            f"Unhandled exception in __main__ async execution: {e_main_async}",
+            exc_info=True,
+        )
         if not global_shutdown_event.is_set():
             global_shutdown_event.set()
+        if not main_task.done():
+            main_task.cancel()
+            try:
+                loop.run_until_complete(main_task)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
     finally:
-        logger.info("Main (__main__) thread: Initiating final cleanup...")
-        if main_app_thread.is_alive():
-            logger.info(
-                "Main (__main__) thread: Waiting for app service thread to complete shutdown..."
-            )
-            main_app_thread.join(timeout=15)  # Dar tiempo para el shutdown
-
-        if main_app_thread.is_alive():
+        logger.info("Main (__main__) thread: Finalizing asyncio loop...")
+        current_loop = (
+            asyncio.get_event_loop()
+        )  # Obtener el loop actual para el cleanup
+        try:
+            pending_tasks = [
+                task for task in asyncio.all_tasks(loop=current_loop) if not task.done()
+            ]
+            if pending_tasks:
+                logger.info(
+                    f"Cancelling {len(pending_tasks)} outstanding asyncio tasks..."
+                )
+                for task_to_cancel in pending_tasks:
+                    task_to_cancel.cancel()
+                current_loop.run_until_complete(
+                    asyncio.gather(*pending_tasks, return_exceptions=True)
+                )
+                logger.info("Outstanding asyncio tasks processed.")
+        except RuntimeError:
             logger.warning(
-                "Main app service thread did not shut down cleanly after timeout."
+                "Asyncio loop already closed when trying to cancel pending tasks."
             )
-        else:
-            logger.info("Main app service thread has finished.")
+        except Exception as e_cleanup:
+            logger.error(f"Error during asyncio task cleanup: {e_cleanup}")
 
-        # Asegurarse que todos los handlers de logging se cierren y flusheen
+        if not current_loop.is_closed():
+            current_loop.close()
+            logger.info("Asyncio loop closed.")
+
         logging.shutdown()
-        print(
-            "Program finalized."
-        )  # Un print final para saber que terminó si los logs no se ven
+        print("Program finalized.")

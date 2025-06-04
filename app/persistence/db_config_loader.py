@@ -28,18 +28,6 @@ def load_retransmission_configs_from_db1() -> Optional[Dict[int, Dict[str, Any]]
         JOIN g_host_retransmission AS gh ON gr.Id_host = gh.Id;
     """
     try:
-        # Usar los parámetros de conexión generales. Si se usa pooling,
-        # el loader no necesita preocuparse por ello directamente, solo usa los params.
-        # Sin embargo, para operaciones cortas como esta, un pool puede ser overkill
-        # a menos que esta función se llame muy frecuentemente.
-        # Si hay un pool definido en DB_CONN_PARAMS, connect() podría usarlo o no
-        # dependiendo de cómo mysql.connector maneje eso.
-        # Para simplicidad, asumimos que connect() crea una conexión directa aquí
-        # o que si se usa un pool, se obtiene de otra manera (lo cual LogWriterDB sí hace).
-        # Para ser explícitos, si db_config_loader debe usar el pool,
-        # se necesitaría una función similar a _get_connection de LogWriterDB.
-        # Por ahora, se crea conexión directa.
-
         temp_conn_params = DB_CONN_PARAMS.copy()
         temp_conn_params.pop("pool_name", None)
         temp_conn_params.pop("pool_size", None)

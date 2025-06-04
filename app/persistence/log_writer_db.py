@@ -257,23 +257,23 @@ class LogWriterDB:
             if info_count > 0:
                 summary_parts.append(f"INFOs: {info_count}")
                 if info_placas_set:
-                    placas_str = ", ".join(sorted(list(info_placas_set))[:3])
+                    placas_str = ", ".join(sorted(list(info_placas_set)))
                     summary_parts.append(
                         f"(Placas INFO: {placas_str})"
                     )
             if error_count > 0:
                 summary_parts.append(f"ERRORs: {error_count}")
                 if error_placas_set:
-                    placas_str = ", ".join(sorted(list(error_placas_set))[:3])
+                    placas_str = ", ".join(sorted(list(error_placas_set)))
                     summary_parts.append(
                         f"(Placas ERROR: {placas_str})"
                     )
             if other_count > 0:
                 summary_parts.append(f"OTHERs: {other_count}")
                 if other_placas_set:
-                    placas_str = ", ".join(sorted(list(other_placas_set))[:3])
+                    placas_str = ", ".join(sorted(list(other_placas_set)))
                     summary_parts.append(
-                        f"(Placas OTHER: {placas_str}{', ...' if len(other_placas_set) > 3 else ''})"
+                        f"(Placas OTHER: {placas_str})"
                     )
             logger.info(" ".join(summary_parts))
             self._consecutive_db_connection_failures = 0  # type: ignore [attr-defined]

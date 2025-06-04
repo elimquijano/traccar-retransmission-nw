@@ -3,7 +3,7 @@ from typing import Dict, Any
 from app.services.base_retransmission_handler import BaseRetransmissionHandler
 
 # Import helpers/constants directly if BaseRetransmissionHandler doesn't re-export them conveniently
-from app.utils.helpers import format_traccar_datetime_with_offset
+from app.utils.helpers import format_traccar_datetime_for_handler
 from app.config import DATETIME_OFFSET_HOURS
 
 logger = logging.getLogger(__name__)
@@ -39,8 +39,8 @@ class SeguridadCiudadanaHandler(BaseRetransmissionHandler):
                     f"(Handler: {self.HANDLER_ID})"
                 )
 
-        fecha_hora_final = format_traccar_datetime_with_offset(
-            traccar_position.get("deviceTime"), hours_offset=DATETIME_OFFSET_HOURS
+        fecha_hora_final = format_traccar_datetime_for_handler(
+            traccar_position.get("deviceTime"), self.HANDLER_ID, default_hours_offset=DATETIME_OFFSET_HOURS
         )
 
         # Ensure 'placa' is in the payload for logging by the base handler
