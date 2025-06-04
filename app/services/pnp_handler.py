@@ -4,71 +4,123 @@ from app.services.base_retransmission_handler import BaseRetransmissionHandler
 from app.utils.helpers import format_traccar_datetime_for_handler
 from app.config import DATETIME_OFFSET_HOURS
 
+# Configuramos el logger para esta clase
 logger = logging.getLogger(__name__)
 
 
 class PnpHandler(BaseRetransmissionHandler):
-    HANDLER_ID = "pnp"  # Must match a value in RETRANSMISSION_HANDLER_MAP
+    """
+    Manejador específico para la retransmisión de datos a la PNP (Policía Nacional del Perú).
+    Transforma los datos de posición de Traccar al formato requerido por el sistema de la PNP.
+
+    Esta clase implementa los métodos abstractos de BaseRetransmissionHandler
+    para adaptar los datos al formato específico que necesita el sistema de la PNP.
+    """
+
+    # Identificador único para este manejador
+    # Debe coincidir con un valor en RETRANSMISSION_HANDLER_MAP de la configuración
+    HANDLER_ID = "pnp"
 
     def get_handler_id(self) -> str:
+        """
+        Devuelve el identificador único para este manejador.
+
+        Returns:
+            str: El identificador 'pnp' que corresponde a este manejador.
+        """
         return self.HANDLER_ID
 
     def transform_payload(
         self,
         traccar_position: Dict[str, Any],
         device_info: Dict[str, Any],
-        retrans_config_for_device: Dict[str, Any],  # Full config from BD1
+        retrans_config_for_device: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """
+        Transforma los datos de posición de Traccar al formato específico requerido por la PNP.
+
+        Args:
+            traccar_position: Diccionario con los datos de posición del dispositivo desde Traccar.
+            device_info: Información adicional sobre el dispositivo (incluye la placa).
+            retrans_config_for_device: Configuración completa de retransmisión para este dispositivo.
+
+        Returns:
+            Dict[str, Any]: Un diccionario con los datos transformados en el formato esperado por la PNP.
+        """
+        # Obtenemos los atributos adicionales de la posición
         attributes = traccar_position.get("attributes", {})
 
+        # Obtenemos y procesamos las distancias (en metros)
         distancia_actual_mts = float(attributes.get("distance", 0.0))
         total_distancia_acum_mts = float(attributes.get("totalDistance", 0.0))
 
+        # Procesamos las horas del motor (convertimos de milisegundos a horas)
         engine_hours_ms = attributes.get("hours")
         total_horas_motor_acum = 0.0
+
         if engine_hours_ms is not None:
             try:
+                # Convertimos milisegundos a horas (1 hora = 1000 ms * 60 s * 60 min)
                 total_horas_motor_acum = float(engine_hours_ms) / (1000 * 60 * 60)
             except (TypeError, ValueError):
+                # Registramos un warning si no podemos convertir el valor
                 logger.warning(
-                    f"Could not parse engine hours '{engine_hours_ms}' for device {device_info.get('id')} "
+                    f"No se pudo parsear las horas del motor '{engine_hours_ms}' para el dispositivo {device_info.get('id')}"
                     f"(Handler: {self.HANDLER_ID})"
                 )
 
+        # Formateamos la fecha y hora según el formato requerido por la PNP
         fecha_hora_final = format_traccar_datetime_for_handler(
-            traccar_position.get("deviceTime"), self.HANDLER_ID, default_hours_offset=DATETIME_OFFSET_HOURS
+            traccar_position.get("deviceTime"),
+            self.HANDLER_ID,
+            default_hours_offset=DATETIME_OFFSET_HOURS,
         )
 
-        # Ensure 'placa' is in the payload for logging by the base handler
-        placa = str(device_info.get("name", ""))  # Assuming device name is the plate
+        # Obtenemos la placa del vehículo (asumimos que el nombre del dispositivo es la placa)
+        placa = str(device_info.get("name", ""))
 
+        # Creamos el payload con los datos transformados según el formato de la PNP
         payload = {
+            # Información de alarmas (obtenida de los atributos)
             "alarma": str(attributes.get("alarm", "")),
+            # Datos de posición geográfica
             "altitud": float(traccar_position.get("altitude", 0.0)),
-            "angulo": int(traccar_position.get("course", 0)),
-            "codigoComisaria": "217483",
-            "distancia": round(distancia_actual_mts, 2),
-            "fechaHora": fecha_hora_final,
-            "horasMotor": 0.0,  # This field was always 0.0 in original code, confirm if still needed
-            "idMunicipalidad": str(retrans_config_for_device.get("id_municipalidad", "")),
-            "idTransmision": str(retrans_config_for_device.get("id_municipalidad", "")),
-            "ignition": bool(attributes.get("ignition", False)),
-            "imei": str(retrans_config_for_device.get("imei", "")),
+            "angulo": int(traccar_position.get("course", 0)),  # Rumbo o curso
             "latitud": float(traccar_position.get("latitude", 0.0)),
             "longitud": float(traccar_position.get("longitude", 0.0)),
-            "motion": bool(attributes.get("motion", False)),
-            "placa": placa,  # Crucial for logging in BaseRetransmissionHandler
+            # Código de comisaría (valor fijo)
+            "codigoComisaria": "217483",
+            # Datos de distancia (redondeados a 2 decimales)
+            "distancia": round(distancia_actual_mts, 2),
             "totalDistancia": round(total_distancia_acum_mts, 2),
+            # Fecha y hora del evento
+            "fechaHora": fecha_hora_final,
+            # Horas del motor (este campo siempre era 0.0 en el código original)
+            "horasMotor": 0.0,
+            # Identificadores y tokens
+            "idMunicipalidad": str(
+                retrans_config_for_device.get("id_municipalidad", "")
+            ),
+            "idTransmision": str(retrans_config_for_device.get("id_municipalidad", "")),
+            "imei": str(retrans_config_for_device.get("imei", "")),
+            # Estado del encendido y movimiento
+            "ignition": bool(attributes.get("ignition", False)),
+            "motion": bool(attributes.get("motion", False)),
+            # Placa del vehículo (importante para el logging)
+            "placa": placa,
+            # Horas totales del motor (convertidas y redondeadas)
             "totalHorasMotor": round(total_horas_motor_acum, 2),
-            "ubigeo": str(
-                retrans_config_for_device.get("bypass", "")
-            ),  # 'bypass' field used as ubigeo
-            "valid": bool(traccar_position.get("valid", True)),  # Default to True
-            "velocidad": round(
-                float(traccar_position.get("speed", 0.0)) * 1.852, 2
-            ),  # Knots to km/h
+            # UBIGEO (usamos el campo 'bypass' de la configuración)
+            "ubigeo": str(retrans_config_for_device.get("bypass", "")),
+            # Validez de la posición (por defecto True)
+            "valid": bool(traccar_position.get("valid", True)),
+            # Velocidad convertida de nudos a km/h y redondeada
+            "velocidad": round(float(traccar_position.get("speed", 0.0)) * 1.852, 2),
         }
+
+        # Registramos información de depuración sobre el payload transformado
         logger.debug(
-            f"Payload transformed by {self.HANDLER_ID} for placa {payload['placa']}: {str(payload)[:500]}"
+            f"Payload transformado por {self.HANDLER_ID} para placa {payload['placa']}: {str(payload)[:500]}"
         )
+
         return payload
