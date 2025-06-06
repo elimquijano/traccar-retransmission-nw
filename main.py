@@ -5,7 +5,7 @@ import signal
 import os
 
 # Importamos la configuración del logging
-from app.logger_setup import setup_logging
+from app.logger_setup import setup_logging, start_log_rotation_thread, stop_log_rotation_thread
 
 # Configuramos el logging
 logger = setup_logging()
@@ -89,6 +89,7 @@ async def run_application_async(loop: asyncio.AbstractEventLoop):
         loop: Loop de eventos de asyncio
     """
     logger.info("Núcleo de la aplicación asíncrona iniciando...")
+    start_log_rotation_thread()  # Iniciamos el hilo de chequeo de rotación de logs
 
     # Procesamos logs pendientes si está habilitado el LogWriter
     if LOG_WRITER_DB_ENABLED and log_writer_db_instance:
@@ -266,7 +267,8 @@ async def run_application_async(loop: asyncio.AbstractEventLoop):
             logger.info(
                 "Secuencia de apagado de LogWriterDB completada por la aplicación principal."
             )
-
+        
+        stop_log_rotation_thread()
         logger.info(
             "Todos los servicios de la aplicación han sido señalizados para detenerse o han completado su apagado."
         )

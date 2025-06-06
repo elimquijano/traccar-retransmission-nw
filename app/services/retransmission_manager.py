@@ -2,9 +2,11 @@ import logging
 import asyncio
 import aiohttp
 import json
-import certifi
+import threading
+import time
 from collections import deque
 from typing import Deque, Dict, Any, Optional, Tuple, Type, Set
+from app.persistence.db_config_loader import load_retransmission_configs_from_db1
 
 # Importamos configuraciones necesarias
 from app.config import (
@@ -78,6 +80,10 @@ class RetransmissionManager:
         self._retransmission_semaphore = asyncio.Semaphore(
             MAX_CONCURRENT_RETRANSMISSIONS
         )
+        self._on_demand_refresh_thread: Optional[threading.Thread] = None
+        self._on_demand_refresh_lock = threading.Lock()
+        self._last_on_demand_refresh_trigger_time: float = 0
+        self._ON_DEMAND_REFRESH_COOLDOWN_SECONDS: int = 60  # Segundos de cooldown
 
     def _register_handlers(self):
         """
@@ -181,6 +187,119 @@ class RetransmissionManager:
                 exc_info=True,
             )
 
+    def _trigger_on_demand_cache_refresh_non_blocking(self):
+        """
+        Intenta disparar el refresco de cachés en un hilo separado.
+        Usa un lock para asegurar que solo un hilo de refresco se ejecute a la vez.
+        Usa un cooldown para evitar disparos demasiado frecuentes.
+        """
+        if not self.traccar_client:
+            logger.warning(
+                "No se puede disparar refresco bajo demanda: Traccar client no establecido."
+            )
+            return
+
+        current_time = time.time()
+        if (
+            current_time - self._last_on_demand_refresh_trigger_time
+            < self._ON_DEMAND_REFRESH_COOLDOWN_SECONDS
+        ):
+            logger.debug(
+                f"Cooldown de refresco bajo demanda activo ({self._ON_DEMAND_REFRESH_COOLDOWN_SECONDS}s). Saltando disparo de refresco."
+            )
+            return
+
+        if self._on_demand_refresh_lock.acquire(blocking=False):
+            try:
+                if (
+                    self._on_demand_refresh_thread
+                    and self._on_demand_refresh_thread.is_alive()
+                ):
+                    logger.debug("Hilo de refresco bajo demanda ya está activo.")
+                    self._on_demand_refresh_lock.release()
+                    return
+
+                self._last_on_demand_refresh_trigger_time = current_time
+                logger.info(
+                    "Disparando refresco de caché bajo demanda en un hilo separado..."
+                )
+                self._on_demand_refresh_thread = threading.Thread(
+                    target=self._perform_cache_refresh_task_sync,
+                    name="OnDemandCacheRefreshThread",
+                    daemon=True,
+                )
+                self._on_demand_refresh_thread.start()
+            except Exception as e_thread_start:
+                logger.error(
+                    f"Fallo al iniciar hilo de refresco de caché bajo demanda: {e_thread_start}"
+                )
+                self._on_demand_refresh_lock.release()
+        else:
+            logger.debug(
+                "No se pudo adquirir lock para refresco bajo demanda; otro refresco probablemente en curso."
+            )
+
+    def _perform_cache_refresh_task_sync(self):
+        """Tarea síncrona ejecutada en un hilo para refrescar los cachés."""
+        if not self.traccar_client:
+            logger.error(
+                "[OnDemandRefreshThread] Cliente Traccar no disponible. Abortando refresco."
+            )
+            if (
+                self._on_demand_refresh_lock.locked()
+            ):  # Asegurarse de liberar si se adquirió
+                self._on_demand_refresh_lock.release()
+            return
+
+        logger.info(
+            "[OnDemandRefreshThread] Iniciando proceso de refresco de caché bajo demanda..."
+        )
+        try:
+            logger.info("[OnDemandRefreshThread] Obteniendo dispositivos de Traccar...")
+            if (
+                self.traccar_client.fetch_devices()
+            ):  # Actualiza el cache en TraccarClient
+                logger.info(
+                    f"[OnDemandRefreshThread] {len(self.traccar_client.traccar_devices_cache)} Dispositivos de Traccar actualizados."
+                )
+            else:
+                logger.error(
+                    "[OnDemandRefreshThread] Fallo al actualizar dispositivos de Traccar."
+                )
+
+            logger.info(
+                "[OnDemandRefreshThread] Cargando configuraciones de retransmisión desde BD..."
+            )
+            db_configs = load_retransmission_configs_from_db1()
+            if db_configs is not None:
+                self.update_retransmission_configs_from_db1(
+                    db_configs
+                )  # Actualiza el cache aquí
+                logger.info(
+                    f"[OnDemandRefreshThread] {len(db_configs)} Configuraciones de retransmisión actualizadas."
+                )
+            else:
+                logger.error(
+                    "[OnDemandRefreshThread] Fallo al actualizar configuraciones de retransmisión desde BD."
+                )
+
+            logger.info(
+                "[OnDemandRefreshThread] Proceso de refresco de caché bajo demanda completado."
+            )
+        except Exception as e_refresh:
+            logger.error(
+                f"[OnDemandRefreshThread] Excepción durante tarea de refresco de caché: {e_refresh}",
+                exc_info=True,
+            )
+        finally:
+            if (
+                self._on_demand_refresh_lock.locked()
+            ):  # Solo liberar si este hilo lo posee
+                self._on_demand_refresh_lock.release()
+            logger.debug(
+                "[OnDemandRefreshThread] Lock de refresco liberado (si fue adquirido por este hilo)."
+            )
+
     def _enqueue_traccar_positions_from_sync_thread(self, positions_data: list):
         """
         Encola posiciones de Traccar desde un hilo síncrono.
@@ -192,6 +311,7 @@ class RetransmissionManager:
             return
 
         new_positions_added_to_async_queue = 0
+        trigger_refresh_needed_for_batch = False
 
         # Verificamos que el loop de eventos esté disponible
         if not self.loop:
@@ -227,9 +347,22 @@ class RetransmissionManager:
                 device_id_traccar_int
             )
 
-            # Saltamos si no tenemos información completa
             if not device_info or not retrans_config_for_device_bd1:
-                continue
+                logger.info(
+                    f"Datos no encontrados para deviceId {device_id_traccar_int} (pos {pos_id_traccar}). "
+                    f"Cache de dispositivo: {'OK' if device_info else 'FALTA'}, "
+                    f"Cache de config: {'OK' if retrans_config_for_device_bd1 else 'FALTA'}. "
+                    "Se marcará para refresco de caché."
+                )
+                trigger_refresh_needed_for_batch = True
+                # Descartar esta posición actual. Las siguientes se beneficiarán del refresco.
+                self.processed_position_ids.append(
+                    pos_id_traccar
+                )  # Marcar como "procesada" (descartada)
+                logger.debug(
+                    f"Descartando posición {pos_id_traccar} del dispositivo {device_id_traccar_int} que no está en caché."
+                )
+                continue  # No encolar esta posición específica
 
             # Obtenemos la URL de destino
             target_host_url_from_db = retrans_config_for_device_bd1.get("host_url")
@@ -268,11 +401,16 @@ class RetransmissionManager:
                     f"Error al añadir elemento a async_position_queue: {e_put}"
                 )
 
+        if (
+            trigger_refresh_needed_for_batch
+        ):  # Si se detectó algún dispositivo desconocido en el lote
+            self._trigger_on_demand_cache_refresh_non_blocking()
+
         # Registramos información sobre las nuevas posiciones encoladas
         if new_positions_added_to_async_queue > 0:
             q_size = self.async_position_queue.qsize()
             logger.info(
-                f"{new_positions_added_to_async_queue} nuevas posiciones ofrecidas a la cola asíncrona. Tamaño aproximado: {q_size}"
+                f"{new_positions_added_to_async_queue} NUEVAS POSICIONES AÑADIDAS A LA COLA DE RETRANSMISIÓN ASÍNCRONA. Tamaño aproximado: {q_size}"
             )
             if q_size > MAX_QUEUE_SIZE_BEFORE_WARN:
                 logger.warning(
