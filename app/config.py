@@ -97,6 +97,10 @@ AIOHTTP_TOTAL_TIMEOUT_SECONDS = 15
 # Timeout para conexión HTTP (en segundos)
 AIOHTTP_CONNECT_TIMEOUT_SECONDS = 5
 
+# --- AIOHTTP Session Re-creation Settings (NUEVO) ---
+AIOHTTP_SESSION_RECREATE_INTERVAL_SECONDS = 3600  # Ej: Recrear sesión cada 1 hora
+AIOHTTP_SESSION_RECREATE_AFTER_REQUESTS = 10000 # Ej: Recrear sesión después de 10000 peticiones (0 para deshabilitar por conteo)
+
 # --- Validación de Configuraciones Críticas ---
 # Validamos que las credenciales de Traccar estén configuradas
 if not TRACCAR_URL or not TRACCAR_EMAIL or not TRACCAR_PASSWORD:

@@ -7,6 +7,7 @@ import time
 from collections import deque
 from typing import Deque, Dict, Any, Optional, Tuple, Type, Set
 from app.persistence.db_config_loader import load_retransmission_configs_from_db1
+import socket
 
 # Importamos configuraciones necesarias
 from app.config import (
@@ -18,6 +19,8 @@ from app.config import (
     MAX_CONCURRENT_RETRANSMISSIONS,
     AIOHTTP_TOTAL_TIMEOUT_SECONDS,
     AIOHTTP_CONNECT_TIMEOUT_SECONDS,
+    AIOHTTP_SESSION_RECREATE_INTERVAL_SECONDS,
+    AIOHTTP_SESSION_RECREATE_AFTER_REQUESTS,
 )
 
 # Importamos los manejadores específicos y otras dependencias
@@ -84,6 +87,9 @@ class RetransmissionManager:
         self._on_demand_refresh_lock = threading.Lock()
         self._last_on_demand_refresh_trigger_time: float = 0
         self._ON_DEMAND_REFRESH_COOLDOWN_SECONDS: int = 60  # Segundos de cooldown
+        self._aiohttp_session_creation_time: float = 0
+        self._aiohttp_session_request_count: int = 0
+        self._aiohttp_session_lock = asyncio.Lock()
 
     def _register_handlers(self):
         """
@@ -417,6 +423,81 @@ class RetransmissionManager:
                     f"ADVERTENCIA: Tamaño de la cola de retransmisión asíncrona acercándose al límite: {q_size}"
                 )
 
+    async def _get_or_create_aiohttp_session(self) -> aiohttp.ClientSession:
+        """
+        Obtiene la sesión aiohttp existente o crea/recrea una nueva si es necesario.
+        Este método es una corutina y debe ser llamado con await.
+        Usa un asyncio.Lock para asegurar que la creación/recreación sea atómica.
+        """
+        async with self._aiohttp_session_lock:  # Lock para proteger la creación de sesión
+            current_time = time.time()
+
+            # Condiciones para recrear la sesión
+            session_expired_by_time = (
+                AIOHTTP_SESSION_RECREATE_INTERVAL_SECONDS > 0
+                and self._aiohttp_session_creation_time
+                > 0  # Asegurar que ya se creó una vez
+                and (current_time - self._aiohttp_session_creation_time)
+                > AIOHTTP_SESSION_RECREATE_INTERVAL_SECONDS
+            )
+            session_expired_by_count = (
+                AIOHTTP_SESSION_RECREATE_AFTER_REQUESTS > 0
+                and self._aiohttp_session_request_count
+                >= AIOHTTP_SESSION_RECREATE_AFTER_REQUESTS
+            )
+
+            if (
+                not self._aiohttp_session
+                or self._aiohttp_session.closed
+                or session_expired_by_time
+                or session_expired_by_count
+            ):
+                if self._aiohttp_session and not self._aiohttp_session.closed:
+                    logger.info(
+                        f"Recreando ClientSession aiohttp. Razon: "
+                        f"{'tiempo' if session_expired_by_time else ''}"
+                        f"{' y ' if session_expired_by_time and session_expired_by_count else ''}"
+                        f"{'conteo' if session_expired_by_count else ''}"
+                        f"{' o primera creación/cierre' if not (session_expired_by_time or session_expired_by_count) else ''}."
+                        f" Tiempo activo: {current_time - self._aiohttp_session_creation_time:.0f}s, "
+                        f"Peticiones: {self._aiohttp_session_request_count}."
+                    )
+                    await self._aiohttp_session.close()
+
+                logger.info("Creando nueva ClientSession aiohttp...")
+                timeout_config = aiohttp.ClientTimeout(
+                    total=AIOHTTP_TOTAL_TIMEOUT_SECONDS,
+                    connect=AIOHTTP_CONNECT_TIMEOUT_SECONDS,
+                )
+
+                # No se pasa contexto SSL al conector si se va a usar ssl=False en cada post
+                # o si se quiere usar la verificación por defecto del sistema en el conector.
+                # Si se quisiera usar certifi globalmente:
+                # import ssl
+                # ssl_context = ssl.create_default_context(cafile=certifi.where())
+                # connector_ssl_param = ssl_context
+                connector_ssl_param = (
+                    None  # Usará el default del sistema si ssl= no se pasa a post()
+                )
+
+                connector = aiohttp.TCPConnector(
+                    limit_per_host=max(1, MAX_CONCURRENT_RETRANSMISSIONS // 5),
+                    limit=MAX_CONCURRENT_RETRANSMISSIONS,
+                    family=socket.AF_INET,  # <--- Forzar IPv4
+                    ssl=connector_ssl_param,  # <--- Usar None o un contexto SSL
+                    enable_cleanup_closed=True,  # <--- Intentar limpieza más agresiva
+                    keepalive_timeout=30.0,  # <--- Keep-alive más corto (ej. 30s)
+                )
+                self._aiohttp_session = aiohttp.ClientSession(
+                    connector=connector, timeout=timeout_config
+                )
+                self._aiohttp_session_creation_time = current_time
+                self._aiohttp_session_request_count = 0
+
+            if not self._aiohttp_session:  # Fallback por si algo muy raro pasa
+                raise RuntimeError("No se pudo obtener o crear la sesión aiohttp.")
+            return self._aiohttp_session
+
     def _get_handler_instance_for_url(
         self, target_host_url: str
     ) -> Optional[BaseRetransmissionHandler]:
@@ -449,7 +530,7 @@ class RetransmissionManager:
         """
         logger.info("Bucle del worker de retransmisión asíncrono iniciado.")
 
-        # Configuramos timeouts para las solicitudes HTTP
+        """ # Configuramos timeouts para las solicitudes HTTP
         timeout_config = aiohttp.ClientTimeout(
             total=AIOHTTP_TOTAL_TIMEOUT_SECONDS, connect=AIOHTTP_CONNECT_TIMEOUT_SECONDS
         )
@@ -464,7 +545,7 @@ class RetransmissionManager:
         # Creamos la sesión aiohttp
         self._aiohttp_session = aiohttp.ClientSession(
             connector=connector, timeout=timeout_config
-        )
+        ) """
 
         # Conjunto para llevar seguimiento de las tareas activas
         active_tasks: Set[asyncio.Task] = set()
@@ -489,9 +570,23 @@ class RetransmissionManager:
                     # Adquirimos el semáforo para limitar las retransmisiones concurrentes
                     await self._retransmission_semaphore.acquire()
 
+                    try:
+                        current_session = await self._get_or_create_aiohttp_session()
+                    except RuntimeError as e_session:
+                        logger.error(
+                            f"Fallo crítico al obtener/crear sesión aiohttp: {e_session}. Reintentando en el próximo ciclo."
+                        )
+                        self._retransmission_semaphore.release()  # Liberar semáforo si no se puede crear tarea
+                        await asyncio.sleep(
+                            1
+                        )  # Pequeña pausa antes de reintentar el bucle principal
+                        continue  # Saltar este ítem y reintentar el bucle para obtener sesión
+
                     # Creamos una tarea para procesar el elemento
                     task = asyncio.create_task(
-                        self._process_item_async_with_retries(queue_item_to_process)
+                        self._process_item_async_with_retries(
+                            queue_item_to_process, current_session
+                        )
                     )
                     active_tasks.add(task)
 
@@ -529,13 +624,16 @@ class RetransmissionManager:
         finally:
             # Cerramos la sesión aiohttp
             if self._aiohttp_session and not self._aiohttp_session.closed:
+                logger.info("Cerrando la sesión aiohttp final al detener el worker.")
                 await self._aiohttp_session.close()
                 self._aiohttp_session = None
             logger.info(
                 "Bucle del worker de retransmisión asíncrono detenido elegantemente."
             )
 
-    async def _process_item_async_with_retries(self, queue_item: Dict[str, Any]):
+    async def _process_item_async_with_retries(
+        self, queue_item: Dict[str, Any], session: aiohttp.ClientSession
+    ):
         """
         Procesa un elemento de la cola con reintentos en caso de fallo.
 
@@ -633,6 +731,7 @@ class RetransmissionManager:
             # Ejecutamos un intento de retransmisión
             current_success, current_response_text, current_status_code = (
                 await self._execute_single_aiohttp_post(
+                    session,
                     actual_target_url,
                     json_send_str_for_log,
                     http_headers,
@@ -677,6 +776,9 @@ class RetransmissionManager:
                         f"Todos los {MAX_RETRANSMISSION_ATTEMPTS} intentos asíncronos fallaron para posición {pos_id_display} (placa {placa_for_log}). Estado final: {final_status_code}, Respuesta: {final_response_text[:100]}"
                     )
 
+        async with self._aiohttp_session_lock:  # Proteger acceso a _aiohttp_session_request_count
+            self._aiohttp_session_request_count += 1
+
         # Registramos el resultado final en la base de datos
         self._log_to_db_from_async(
             final_response_text,
@@ -688,6 +790,7 @@ class RetransmissionManager:
 
     async def _execute_single_aiohttp_post(
         self,
+        session: aiohttp.ClientSession,
         target_url: str,
         json_payload_str: str,
         http_headers: Dict[str, str],
@@ -714,11 +817,11 @@ class RetransmissionManager:
         status_code = None
 
         # Verificamos que la sesión aiohttp esté disponible
-        if not self._aiohttp_session or self._aiohttp_session.closed:
+        if session.closed:
             logger.error(
-                f"Sesión AIOHTTP no disponible para posición {pos_id_display} (intento {attempt_num})."
+                f"AIOHTTP session passed to _execute_single_aiohttp_post is closed for pos {pos_id_display} (attempt {attempt_num})."
             )
-            return False, "Sesión AIOHTTP cerrada", None
+            return False, "AIOHTTP session (passed) closed", None
 
         try:
             logger.debug(
@@ -726,7 +829,7 @@ class RetransmissionManager:
             )
 
             # Ejecutamos la solicitud POST
-            async with self._aiohttp_session.post(
+            async with session.post(
                 target_url, data=json_payload_str, headers=http_headers, ssl=False
             ) as response:
                 status_code = response.status
