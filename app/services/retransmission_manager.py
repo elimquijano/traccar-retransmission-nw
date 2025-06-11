@@ -426,15 +426,17 @@ class RetransmissionManager:
     async def _get_or_create_aiohttp_session(self) -> aiohttp.ClientSession:
         """
         Obtiene la sesión aiohttp existente o crea/recrea una nueva si es necesario.
-        Versión mejorada para evitar problemas de file descriptors.
+        Este método es una corutina y debe ser llamado con await.
+        Usa un asyncio.Lock para asegurar que la creación/recreación sea atómica.
         """
-        async with self._aiohttp_session_lock:
+        async with self._aiohttp_session_lock:  # Lock para proteger la creación de sesión
             current_time = time.time()
 
-            # Condiciones para recrear la sesión (más agresivas)
+            # Condiciones para recrear la sesión
             session_expired_by_time = (
                 AIOHTTP_SESSION_RECREATE_INTERVAL_SECONDS > 0
-                and self._aiohttp_session_creation_time > 0
+                and self._aiohttp_session_creation_time
+                > 0  # Asegurar que ya se creó una vez
                 and (current_time - self._aiohttp_session_creation_time)
                 > AIOHTTP_SESSION_RECREATE_INTERVAL_SECONDS
             )
@@ -451,53 +453,49 @@ class RetransmissionManager:
                 or session_expired_by_count
             ):
                 if self._aiohttp_session and not self._aiohttp_session.closed:
-                    logger.info("Cerrando sesión aiohttp existente antes de recrear...")
-                    # Cerrar conexiones de forma más agresiva
+                    logger.info(
+                        f"Recreando ClientSession aiohttp. Razon: "
+                        f"{'tiempo' if session_expired_by_time else ''}"
+                        f"{' y ' if session_expired_by_time and session_expired_by_count else ''}"
+                        f"{'conteo' if session_expired_by_count else ''}"
+                        f"{' o primera creación/cierre' if not (session_expired_by_time or session_expired_by_count) else ''}."
+                        f" Tiempo activo: {current_time - self._aiohttp_session_creation_time:.0f}s, "
+                        f"Peticiones: {self._aiohttp_session_request_count}."
+                    )
                     await self._aiohttp_session.close()
-                    # Esperar un poco para asegurar el cierre completo
-                    await asyncio.sleep(0.1)
 
-                logger.info(
-                    "Creando nueva ClientSession aiohttp con configuración mejorada..."
-                )
-
-                # CONFIGURACIÓN MEJORADA DEL CONNECTOR
-                connector = aiohttp.TCPConnector(
-                    # Límites más conservadores
-                    limit_per_host=min(10, max(1, MAX_CONCURRENT_RETRANSMISSIONS // 3)),
-                    limit=MAX_CONCURRENT_RETRANSMISSIONS,
-                    # Configuraciones clave para evitar FD issues
-                    family=socket.AF_INET,  # Forzar IPv4
-                    ssl=None,  # Usar SSL por defecto del sistema
-                    # Limpieza agresiva de conexiones
-                    enable_cleanup_closed=True,
-                    force_close=True,  # Forzar cierre de conexiones
-                    # Timeouts más cortos para evitar conexiones colgadas
-                    keepalive_timeout=15.0,  # Reducido de 30s a 15s
-                    ttl_dns_cache=60,  # Cache DNS más corto
-                    # Configuración para resolver problemas de FD
-                    use_dns_cache=True,
-                    resolver=aiohttp.AsyncResolver(),  # Resolver asíncrono
-                )
-
+                logger.info("Creando nueva ClientSession aiohttp...")
                 timeout_config = aiohttp.ClientTimeout(
                     total=AIOHTTP_TOTAL_TIMEOUT_SECONDS,
-                    connect=min(
-                        10, AIOHTTP_CONNECT_TIMEOUT_SECONDS
-                    ),  # Timeout de conexión más corto
-                    sock_connect=5,  # Timeout específico para socket connect
-                    sock_read=AIOHTTP_TOTAL_TIMEOUT_SECONDS - 5,
+                    connect=AIOHTTP_CONNECT_TIMEOUT_SECONDS,
                 )
 
+                # No se pasa contexto SSL al conector si se va a usar ssl=False en cada post
+                # o si se quiere usar la verificación por defecto del sistema en el conector.
+                # Si se quisiera usar certifi globalmente:
+                # import ssl
+                # ssl_context = ssl.create_default_context(cafile=certifi.where())
+                # connector_ssl_param = ssl_context
+                connector_ssl_param = (
+                    None  # Usará el default del sistema si ssl= no se pasa a post()
+                )
+
+                connector = aiohttp.TCPConnector(
+                    limit_per_host=max(1, MAX_CONCURRENT_RETRANSMISSIONS // 5),
+                    limit=MAX_CONCURRENT_RETRANSMISSIONS,
+                    family=socket.AF_INET,  # <--- Forzar IPv4
+                    ssl=connector_ssl_param,  # <--- Usar None o un contexto SSL
+                    enable_cleanup_closed=True,  # <--- Intentar limpieza más agresiva
+                    keepalive_timeout=30.0,  # <--- Keep-alive más corto (ej. 30s)
+                )
                 self._aiohttp_session = aiohttp.ClientSession(
-                    connector=connector,
-                    timeout=timeout_config,
-                    connector_owner=True,  # Asegurar que la sesión posee el connector
+                    connector=connector, timeout=timeout_config
                 )
-
                 self._aiohttp_session_creation_time = current_time
                 self._aiohttp_session_request_count = 0
 
+            if not self._aiohttp_session:  # Fallback por si algo muy raro pasa
+                raise RuntimeError("No se pudo obtener o crear la sesión aiohttp.")
             return self._aiohttp_session
 
     def _get_handler_instance_for_url(
@@ -801,112 +799,111 @@ class RetransmissionManager:
         attempt_num: int,
     ) -> Tuple[bool, str, Optional[int]]:
         """
-        Versión mejorada con mejor manejo de errores de FD.
+        Ejecuta una solicitud POST HTTP individual usando aiohttp.
+
+        Args:
+            target_url: URL de destino.
+            json_payload_str: Payload en formato JSON como string.
+            http_headers: Headers HTTP para la solicitud.
+            pos_id_display: ID de la posición para logging.
+            placa_for_log: Placa del vehículo para logging.
+            attempt_num: Número de intento actual.
+
+        Returns:
+            Tuple[bool, str, Optional[int]]: Tupla con (éxito, texto de respuesta, código de estado).
         """
         success = False
         response_text = "Sin respuesta"
         status_code = None
 
+        # Verificamos que la sesión aiohttp esté disponible
         if session.closed:
             logger.error(
-                f"Session cerrada para pos {pos_id_display} (attempt {attempt_num})"
+                f"AIOHTTP session passed to _execute_single_aiohttp_post is closed for pos {pos_id_display} (attempt {attempt_num})."
             )
-            return False, "Session cerrada", None
+            return False, "AIOHTTP session (passed) closed", None
 
         try:
             logger.debug(
-                f"POST (intento {attempt_num}) a {target_url} para pos {pos_id_display}"
+                f"POST AIOHTTP (intento {attempt_num}) a {target_url} para posición {pos_id_display} (placa {placa_for_log}) con headers {http_headers}"
             )
 
-            # Configurar parámetros específicos para esta request
-            request_timeout = aiohttp.ClientTimeout(
-                total=min(30, AIOHTTP_TOTAL_TIMEOUT_SECONDS),
-                connect=5,  # Timeout de conexión muy corto
-                sock_connect=3,  # Timeout de socket aún más corto
-            )
-
+            # Ejecutamos la solicitud POST
             async with session.post(
-                target_url,
-                data=json_payload_str,
-                headers=http_headers,
-                ssl=False,
-                timeout=request_timeout,
-                # Parámetros adicionales para evitar problemas de conexión
-                allow_redirects=False,  # Evitar redirects que pueden causar problemas
+                target_url, data=json_payload_str, headers=http_headers, ssl=False
             ) as response:
                 status_code = response.status
 
                 try:
+                    # Leemos el cuerpo de la respuesta
                     response_body = await response.text(
                         encoding="utf-8", errors="replace"
                     )
                     response_text = response_body[:1000]
                 except Exception as e_read_body:
-                    response_text = f"Error leyendo respuesta: {e_read_body}"
-                    logger.warning(f"Error leyendo body de {target_url}: {e_read_body}")
+                    response_text = (
+                        f"No se pudo leer el cuerpo de la respuesta: {e_read_body}"
+                    )
+                    logger.warning(
+                        f"Error al leer el cuerpo de la respuesta desde {target_url} para posición {pos_id_display} (intento {attempt_num}): {e_read_body}"
+                    )
 
-                # Procesar respuesta
+                # Procesamos la respuesta
                 if 200 <= status_code < 300:
+                    # Éxito
+                    success_msg_detail = (
+                        f" (Cuerpo: {response_text[:60]})"
+                        if response_text
+                        and response_text
+                        != "Se ha registrado de forma exitosa el punto gps"
+                        else ""
+                    )
+
+                    # Lógica específica para mensajes de éxito
                     if status_code in [200, 201] and target_url.startswith(
                         "https://seguridadciudadana.mininter.gob.pe"
                     ):
                         response_text = "Se ha registrado de forma exitosa el punto gps"
 
                     logger.info(
-                        f"POST Éxito (intento {attempt_num}): {status_code} para pos {pos_id_display}"
+                        f"POST AIOHTTP Éxito (intento {attempt_num}): Estado {status_code} para posición {pos_id_display}, placa {placa_for_log}"
                     )
                     success = True
                 else:
+                    # Error HTTP
                     logger.warning(
-                        f"POST Fallo (intento {attempt_num}): {status_code} para pos {pos_id_display}"
+                        f"POST AIOHTTP Fallo (intento {attempt_num}): Estado {status_code} para posición {pos_id_display}, placa {placa_for_log}. Respuesta: {response_text}"
                     )
                     success = False
 
-        except RuntimeError as runtime_err:
-            # MANEJO ESPECÍFICO PARA ERRORES DE FILE DESCRIPTOR
-            if "File descriptor" in str(runtime_err) and "is used by transport" in str(
-                runtime_err
-            ):
-                response_text = f"Error de File Descriptor: {runtime_err}"
-                logger.error(
-                    f"ERROR FD (intento {attempt_num}) para {target_url}, pos {pos_id_display}: {runtime_err}"
-                )
-
-                # Marcar la sesión para recreación inmediata
-                logger.warning("Marcando sesión para recreación debido a error de FD")
-                self._aiohttp_session_request_count = (
-                    AIOHTTP_SESSION_RECREATE_AFTER_REQUESTS + 1
-                )
-
-                # Intentar limpieza forzada en el siguiente ciclo
-                asyncio.create_task(self._force_session_cleanup())
-
-            else:
-                response_text = f"Error de runtime: {runtime_err}"
-                logger.error(f"RuntimeError (intento {attempt_num}): {runtime_err}")
-
-        except aiohttp.ClientConnectorError as conn_err:
-            response_text = f"Error de conexión: {conn_err}"
-            logger.warning(
-                f"Error conexión (intento {attempt_num}) para {target_url}: {conn_err}"
-            )
-
-            # Si es un error persistente de conexión, recrear sesión
-            if attempt_num >= 3:
-                self._aiohttp_session_request_count = (
-                    AIOHTTP_SESSION_RECREATE_AFTER_REQUESTS + 1
-                )
-
-        except asyncio.TimeoutError:
-            response_text = "Timeout de request"
-            logger.warning(
-                f"Timeout (intento {attempt_num}) para {target_url}, pos {pos_id_display}"
-            )
-
-        except Exception as e:
-            response_text = f"Error inesperado: {e}"
+        except aiohttp.ClientSSLError as ssl_err:
+            response_text = f"Error SSL de AIOHTTP: {ssl_err}"
             logger.error(
-                f"Error inesperado (intento {attempt_num}): {e}", exc_info=True
+                f"Error SSL de AIOHTTP (Intento {attempt_num}) para {target_url}, posición {pos_id_display}: {ssl_err}",
+                exc_info=False,
+            )
+        except aiohttp.ClientConnectorError as conn_err:
+            response_text = f"Error de conexión de AIOHTTP: {conn_err}"
+            logger.warning(
+                f"Error de conexión de AIOHTTP (Intento {attempt_num}) para {target_url}, posición {pos_id_display}: {conn_err}"
+            )
+        except asyncio.TimeoutError:
+            response_text = "Timeout de AIOHTTP"
+            logger.warning(
+                f"Timeout de AIOHTTP (Intento {attempt_num}) para {target_url}, posición {pos_id_display}"
+            )
+        except aiohttp.ClientError as client_err:
+            response_text = f"Error de cliente de AIOHTTP: {client_err}"
+            if hasattr(client_err, "status") and client_err.status:
+                status_code = client_err.status
+            logger.warning(
+                f"Error de cliente de AIOHTTP (Intento {attempt_num}) para {target_url}, posición {pos_id_display}: {client_err}"
+            )
+        except Exception as e:
+            response_text = f"Error inesperado en intento de AIOHTTP: {e}"
+            logger.error(
+                f"Error inesperado (Intento {attempt_num}) durante POST aiohttp a {target_url}, posición {pos_id_display}: {e}",
+                exc_info=True,
             )
 
         return success, response_text, status_code
@@ -1001,24 +998,3 @@ class RetransmissionManager:
                 )
 
         self.worker_task = None
-
-    async def _force_session_cleanup(self):
-        """
-        Fuerza la limpieza de la sesión aiohttp cuando se detectan problemas.
-        """
-        if self._aiohttp_session and not self._aiohttp_session.closed:
-            try:
-                # Cerrar todas las conexiones del connector
-                if hasattr(self._aiohttp_session, "_connector"):
-                    await self._aiohttp_session._connector.close()
-
-                # Cerrar la sesión
-                await self._aiohttp_session.close()
-
-                # Esperar un poco más para asegurar limpieza
-                await asyncio.sleep(0.2)
-
-            except Exception as e:
-                logger.warning(f"Error durante limpieza forzada de sesión: {e}")
-            finally:
-                self._aiohttp_session = None
