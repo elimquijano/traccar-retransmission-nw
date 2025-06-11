@@ -90,16 +90,12 @@ DB_LOG_BACKUP_FILE_PATH = os.path.join(LOGS_DIR_NAME, "pending_db_logs.jsonl")
 MAX_DB_CONNECTION_FAILURES_BEFORE_BACKUP = 3
 
 # --- Configuración de Retransmisión Asíncrona ---
-# Número máximo de retransmisiones concurrentes
-MAX_CONCURRENT_RETRANSMISSIONS = 100
-# Timeout total para solicitudes HTTP (en segundos)
-AIOHTTP_TOTAL_TIMEOUT_SECONDS = 15
-# Timeout para conexión HTTP (en segundos)
+# Configuraciones más agresivas para evitar acumulación de FDs
+AIOHTTP_SESSION_RECREATE_INTERVAL_SECONDS = 1800  # 30 min
+AIOHTTP_SESSION_RECREATE_AFTER_REQUESTS = 1000
+AIOHTTP_TOTAL_TIMEOUT_SECONDS = 30
 AIOHTTP_CONNECT_TIMEOUT_SECONDS = 5
-
-# --- AIOHTTP Session Re-creation Settings (NUEVO) ---
-AIOHTTP_SESSION_RECREATE_INTERVAL_SECONDS = 3600  # Ej: Recrear sesión cada 1 hora
-AIOHTTP_SESSION_RECREATE_AFTER_REQUESTS = 10000 # Ej: Recrear sesión después de 10000 peticiones (0 para deshabilitar por conteo)
+MAX_CONCURRENT_RETRANSMISSIONS = 10  # Reducir si es muy alto
 
 # --- Validación de Configuraciones Críticas ---
 # Validamos que las credenciales de Traccar estén configuradas
