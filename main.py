@@ -1,5 +1,7 @@
-import logging
 import asyncio
+import uvloop
+uvloop.install()
+import logging
 import threading
 import signal
 import os

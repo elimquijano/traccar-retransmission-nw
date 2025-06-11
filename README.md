@@ -1,6 +1,6 @@
 # Sistema de Retransmisión de Datos GPS
 
-Un sistema robusto para recibir datos GPS desde Traccar y retransmitirlos a múltiples sistemas externos con diferentes formatos requeridos.
+Un sistema robusto para recibir datos GPS desde Traccar y retransmitirlos a múltiples sistemas externos con diferentes formatos requeridos(solo Linux).
 
 ## Descripción General
 
