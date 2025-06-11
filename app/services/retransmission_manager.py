@@ -486,7 +486,7 @@ class RetransmissionManager:
                     family=socket.AF_INET,  # <--- Forzar IPv4
                     ssl=connector_ssl_param,  # <--- Usar None o un contexto SSL
                     enable_cleanup_closed=True,  # <--- Intentar limpieza más agresiva
-                    keepalive_timeout=30.0,  # <--- Keep-alive más corto (ej. 30s)
+                    force_close=True
                 )
                 self._aiohttp_session = aiohttp.ClientSession(
                     connector=connector, timeout=timeout_config
