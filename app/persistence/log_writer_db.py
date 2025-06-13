@@ -203,6 +203,7 @@ class LogWriterDB:
         placa: str,
         host: str,
         json_send: str,
+        positionId: int,
         origen: str,
     ):
         """
@@ -214,6 +215,7 @@ class LogWriterDB:
             placa: Placa del vehículo asociado
             host: Host destino
             json_send: Datos JSON enviados
+            positionId: ID de la posición
             origen: Origen del log
         """
         # Si no está inicializado o se ha solicitado parada, no hacemos nada
@@ -225,6 +227,7 @@ class LogWriterDB:
 
         # Creamos la tupla con los datos del log
         log_item: LogEntryData = (
+            positionId,
             fecha_hora,
             str(response)[:2048],  # Limitamos a 2048 caracteres
             str(level),
@@ -343,8 +346,8 @@ class LogWriterDB:
 
         # Contamos los diferentes tipos de logs
         for log_entry in batch:
-            level = log_entry[2]
-            placa = log_entry[3]
+            level = log_entry[3]
+            placa = log_entry[4]
 
             if placa == "SYSTEM":
                 pass
@@ -386,7 +389,7 @@ class LogWriterDB:
 
         cursor = None
         # Consulta SQL para insertar los logs
-        query = "INSERT INTO logs (fecha_hora, response, nivel, placa, host, jsonSend, origen) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+        query = "INSERT INTO logs (positionId, fecha_hora, response, nivel, placa, host, jsonSend, origen) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
 
         try:
             # Creamos un cursor y ejecutamos la inserción
@@ -492,13 +495,14 @@ class LogWriterDB:
             with open(DB_LOG_BACKUP_FILE_PATH, "a", encoding="utf-8") as f:
                 for log_entry_tuple in batch:
                     log_entry_dict = {
-                        "fecha_hora": log_entry_tuple[0],
-                        "response": log_entry_tuple[1],
-                        "nivel": log_entry_tuple[2],
-                        "placa": log_entry_tuple[3],
-                        "host": log_entry_tuple[4],
-                        "jsonSend": log_entry_tuple[5],
-                        "origen": log_entry_tuple[6],
+                        "positionId": log_entry_tuple[0],
+                        "fecha_hora": log_entry_tuple[1],
+                        "response": log_entry_tuple[2],
+                        "nivel": log_entry_tuple[3],
+                        "placa": log_entry_tuple[4],
+                        "host": log_entry_tuple[5],
+                        "jsonSend": log_entry_tuple[6],
+                        "origen": log_entry_tuple[7],
                     }
                     f.write(json.dumps(log_entry_dict) + "\n")
 
@@ -557,6 +561,7 @@ class LogWriterDB:
                         # Intentamos parsear cada línea como JSON
                         log_entry_dict = json.loads(line.strip())
                         log_entry_tuple: LogEntryData = (
+                            log_entry_dict.get("positionId", ""),
                             log_entry_dict.get("fecha_hora", ""),
                             log_entry_dict.get("response", ""),
                             log_entry_dict.get("nivel", "UNKNOWN"),

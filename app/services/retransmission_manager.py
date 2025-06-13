@@ -682,6 +682,7 @@ class RetransmissionManager:
                 placa_for_log,
                 actual_target_url,
                 json.dumps(traccar_pos_data),
+                traccar_pos_data.get("id"),
             )
             return
 
@@ -696,6 +697,7 @@ class RetransmissionManager:
                 placa_for_log,
                 actual_target_url,
                 json_send_str_for_log,
+                traccar_pos_data.get("id"),
             )
             return
 
@@ -786,6 +788,7 @@ class RetransmissionManager:
             placa_for_log,
             actual_target_url,
             json_send_str_for_log,
+            int(pos_id_display),
         )
 
     async def _execute_single_aiohttp_post(
@@ -909,7 +912,13 @@ class RetransmissionManager:
         return success, response_text, status_code
 
     def _log_to_db_from_async(
-        self, response: str, level: str, placa: str, host: str, json_send: str
+        self,
+        response: str,
+        level: str,
+        placa: str,
+        host: str,
+        json_send: str,
+        positionId: int,
     ):
         """
         Registra un log en la base de datos desde un contexto asíncrono.
@@ -920,6 +929,7 @@ class RetransmissionManager:
             placa: Placa del vehículo.
             host: Host de destino.
             json_send: JSON enviado.
+            positionId: ID de la posición.
         """
         if log_writer_db_instance:
             try:
@@ -929,6 +939,7 @@ class RetransmissionManager:
                     placa,
                     host,
                     json_send,
+                    positionId,
                     LOG_ORIGIN_RETRANSMISSION_GPS,
                 )
             except Exception as e:
