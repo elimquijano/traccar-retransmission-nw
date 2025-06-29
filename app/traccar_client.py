@@ -135,23 +135,46 @@ class TraccarClient:
             )
 
     # NUEVO: Métodos para controlar el heartbeat
+
     def _start_heartbeat(self):
-        """Inicia un hilo que envía un mensaje periódico para mantener la conexión activa."""
+        """
+        Inicia un hilo que envía un mensaje periódico para mantener la conexión activa.
+        MODIFICADO: Envía el primer mensaje inmediatamente.
+        """
         self.heartbeat_stop_event.clear()
 
         def heartbeat_loop():
             logger.info("Hilo de heartbeat iniciado.")
+
+            # --- INICIO DE LA MODIFICACIÓN ---
+            # Enviar el primer heartbeat inmediatamente para vencer el timeout agresivo
+            try:
+                if self.ws_app and self.ws_app.sock and self.ws_app.sock.connected:
+                    self.ws_app.send("{}")
+                    logger.info(
+                        "Heartbeat inicial enviado inmediatamente después de la conexión."
+                    )
+                else:
+                    logger.warning(
+                        "No se pudo enviar el heartbeat inicial, el socket ya no está conectado."
+                    )
+                    return  # Salir si la conexión ya se perdió
+            except Exception as e:
+                logger.error(f"Error enviando el heartbeat inicial: {e}")
+                return  # Salir si hay un error
+
+            # Bucle para los siguientes heartbeats
             while not self.heartbeat_stop_event.wait(
                 30
-            ):  # Envía un mensaje cada 30 segundos
+            ):  # Espera 30 segundos para los siguientes
+                # --- FIN DE LA MODIFICACIÓN ---
                 if self.ws_app and self.ws_app.sock and self.ws_app.sock.connected:
                     try:
-                        # Enviamos un JSON vacío. El servidor lo interpreta como actividad.
                         self.ws_app.send("{}")
                         logger.debug("Heartbeat de aplicación enviado al WebSocket.")
                     except Exception as e:
                         logger.error(f"Error al enviar heartbeat de aplicación: {e}")
-                        break  # Salir del bucle si hay un error
+                        break
                 else:
                     logger.warning(
                         "Socket no conectado, deteniendo bucle de heartbeat."
