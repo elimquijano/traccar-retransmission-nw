@@ -2,6 +2,8 @@ import requests
 import websocket  # type: ignore
 import json
 import logging
+import threading  # NUEVO: Importamos threading para el heartbeat
+import time  # NUEVO: Importamos time para el heartbeat
 from typing import Optional, Dict, Any, Callable
 from requests.cookies import RequestsCookieJar
 
@@ -23,11 +25,8 @@ class TraccarClient:
     Cliente para interactuar con el servidor Traccar.
     Maneja la autenticación, obtención de dispositivos y conexión WebSocket.
 
-    Esta clase proporciona métodos para:
-    - Iniciar sesión en Traccar
-    - Obtener dispositivos
-    - Manejar la conexión WebSocket
-    - Actualizar la caché de dispositivos
+    MODIFICADO: Se ha añadido un sistema de 'heartbeat' a nivel de aplicación
+    para mantener la conexión WebSocket activa y evitar desconexiones por 'Idle Timeout'.
     """
 
     def __init__(
@@ -41,12 +40,6 @@ class TraccarClient:
     ):
         """
         Inicializa el cliente Traccar con los callbacks necesarios.
-
-        Args:
-            message_callback: Función callback para manejar mensajes WebSocket
-            open_callback: Función callback cuando se abre la conexión WebSocket
-            close_callback: Función callback cuando se cierra la conexión WebSocket
-            error_callback: Función callback cuando ocurre un error en WebSocket
         """
         # Cookies de sesión para autenticación
         self.session_cookies: Optional[RequestsCookieJar] = None
@@ -59,6 +52,10 @@ class TraccarClient:
         self._error_callback = error_callback
         # Caché de dispositivos Traccar (device_id -> datos del dispositivo)
         self.traccar_devices_cache: Dict[int, Dict[str, Any]] = {}
+
+        # NUEVO: Atributos para el hilo de heartbeat
+        self.heartbeat_thread: Optional[threading.Thread] = None
+        self.heartbeat_stop_event = threading.Event()
 
     def login(self) -> bool:
         """
@@ -105,52 +102,74 @@ class TraccarClient:
             response.raise_for_status()
             devices_list = response.json()
 
-            # Creamos una nueva caché con los dispositivos obtenidos
             new_cache: Dict[int, Dict[str, Any]] = {}
             for dev in devices_list:
                 dev_id = dev.get("id")
                 if dev_id is not None:
-                    new_cache[int(dev_id)] = dev  # Aseguramos que el ID sea entero
+                    new_cache[int(dev_id)] = dev
 
             self.traccar_devices_cache = new_cache
             logger.info(
                 f"Obtenidos {len(self.traccar_devices_cache)} dispositivos de Traccar."
             )
             return True
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Error obteniendo dispositivos de Traccar: {e}")
-        except json.JSONDecodeError as e:
+        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
             logger.error(
-                f"Error decodificando respuesta de dispositivos de Traccar: {e}"
+                f"Error obteniendo o decodificando dispositivos de Traccar: {e}"
             )
         return False
 
     def update_device_cache_from_ws(self, device_updates: list):
         """
         Actualiza la caché local de dispositivos desde mensajes de actualización WebSocket.
-
-        Args:
-            device_updates: Lista de actualizaciones de dispositivos recibidas por WebSocket.
         """
         updated_count = 0
-
         for dev_update in device_updates:
             dev_id = dev_update.get("id")
             if dev_id is not None:
-                try:
-                    self.traccar_devices_cache[int(dev_id)] = (
-                        dev_update  # Aseguramos clave entera
-                    )
-                    updated_count += 1
-                except ValueError:
-                    logger.warning(
-                        f"ID de dispositivo inválido '{dev_id}' en actualización WebSocket. Saltando."
-                    )
-
+                self.traccar_devices_cache[int(dev_id)] = dev_update
+                updated_count += 1
         if updated_count > 0:
             logger.info(
                 f"{updated_count} dispositivos actualizados en caché desde WebSocket."
             )
+
+    # NUEVO: Métodos para controlar el heartbeat
+    def _start_heartbeat(self):
+        """Inicia un hilo que envía un mensaje periódico para mantener la conexión activa."""
+        self.heartbeat_stop_event.clear()
+
+        def heartbeat_loop():
+            logger.info("Hilo de heartbeat iniciado.")
+            while not self.heartbeat_stop_event.wait(
+                30
+            ):  # Envía un mensaje cada 30 segundos
+                if self.ws_app and self.ws_app.sock and self.ws_app.sock.connected:
+                    try:
+                        # Enviamos un JSON vacío. El servidor lo interpreta como actividad.
+                        self.ws_app.send("{}")
+                        logger.debug("Heartbeat de aplicación enviado al WebSocket.")
+                    except Exception as e:
+                        logger.error(f"Error al enviar heartbeat de aplicación: {e}")
+                        break  # Salir del bucle si hay un error
+                else:
+                    logger.warning(
+                        "Socket no conectado, deteniendo bucle de heartbeat."
+                    )
+                    break
+            logger.info("Hilo de heartbeat detenido.")
+
+        self.heartbeat_thread = threading.Thread(
+            target=heartbeat_loop, name="WsHeartbeatThread", daemon=True
+        )
+        self.heartbeat_thread.start()
+
+    def _stop_heartbeat(self):
+        """Detiene el hilo de heartbeat de forma segura."""
+        self.heartbeat_stop_event.set()
+        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
+            self.heartbeat_thread.join(timeout=2)
+            self.heartbeat_thread = None
 
     def connect_websocket(self):
         """
@@ -162,16 +181,12 @@ class TraccarClient:
             )
             return
 
-        # Determinamos el esquema (ws o wss) basado en la URL de Traccar
         ws_scheme = "ws" if TRACCAR_URL.startswith("http:") else "wss"
-
-        # Aseguramos que ws_url_base elimine correctamente http(s):// y cualquier barra final
         ws_url_base = (
             TRACCAR_URL.replace("http://", "", 1).replace("https://", "", 1).rstrip("/")
         )
         websocket_url = f"{ws_scheme}://{ws_url_base}/api/socket"
 
-        # Creamos el header de Cookie para la conexión WebSocket
         cookie_header_value = "; ".join(
             [
                 f"{name}={value}"
@@ -182,17 +197,13 @@ class TraccarClient:
 
         logger.info(f"Intentando conectar al WebSocket de Traccar: {websocket_url}")
 
-        # Aseguramos que ws_app se reinicie si existía una conexión previa que falló
         if self.ws_app:
             try:
-                self.ws_app.close()  # Intentamos cerrar cualquier aplicación existente
-            except (
-                Exception
-            ):  # Ignoramos errores durante el cierre de la aplicación antigua
+                self.ws_app.close()
+            except Exception:
                 pass
             self.ws_app = None
 
-        # Configuramos la aplicación WebSocket con los callbacks
         self.ws_app = websocket.WebSocketApp(
             websocket_url,
             header=headers,
@@ -202,53 +213,29 @@ class TraccarClient:
             on_close=self._on_close_ws,
         )
 
-        # run_forever bloqueará hasta que la conexión WebSocket se cierre o ocurra un error
         self.ws_app.run_forever(
             ping_interval=WS_PING_INTERVAL_SECONDS,
             ping_timeout=WS_PING_TIMEOUT_SECONDS,
-            # ping_payload="PING" # Opcional: si el servidor necesita un formato específico de ping
         )
 
         logger.info("El bucle run_forever del WebSocket de Traccar ha terminado.")
-
-        # Después de que run_forever termina, ws_app podría estar en un estado no usable o cerrado
+        self._stop_heartbeat()  # Aseguramos que el heartbeat se detenga al salir.
         self.ws_app = None
 
     def _on_open_ws(self, ws_app_instance: websocket.WebSocketApp):
-        """
-        Callback llamado cuando se abre la conexión WebSocket.
-
-        Args:
-            ws_app_instance: Instancia de WebSocketApp que se abrió.
-        """
         logger.info("--- Conexión WebSocket de Traccar abierta ---")
+        self._start_heartbeat()  # MODIFICADO: Iniciar el heartbeat al abrir la conexión
         if self._open_callback:
             self._open_callback(ws_app_instance)
 
     def _on_message_ws(self, ws_app_instance: websocket.WebSocketApp, message_str: str):
-        """
-        Callback llamado cuando se recibe un mensaje WebSocket.
-
-        Args:
-            ws_app_instance: Instancia de WebSocketApp.
-            message_str: Mensaje recibido como string.
-        """
-        # Reenvía al callback designado (generalmente del retransmission_manager)
         if self._message_callback:
             self._message_callback(ws_app_instance, message_str)
 
     def _on_error_ws(self, ws_app_instance: websocket.WebSocketApp, error: Exception):
-        """
-        Callback llamado cuando ocurre un error en WebSocket.
-
-        Args:
-            ws_app_instance: Instancia de WebSocketApp.
-            error: Excepción que ocurrió.
-        """
-        # Registramos tipo y representación del error para mejor diagnóstico
         logger.error(
             f"--- Error en WebSocket de Traccar ---: Tipo: {type(error)}, "
-            f"Representación: {repr(error)}, Cadena: {str(error)}"
+            f"Representación: {repr(error)}"
         )
         if self._error_callback:
             self._error_callback(ws_app_instance, error)
@@ -259,32 +246,24 @@ class TraccarClient:
         close_status_code: Optional[int],
         close_msg: Optional[str],
     ):
-        """
-        Callback llamado cuando se cierra la conexión WebSocket.
-
-        Args:
-            ws_app_instance: Instancia de WebSocketApp.
-            close_status_code: Código de estado de cierre.
-            close_msg: Mensaje de cierre.
-        """
         logger.warning(
             f"--- Conexión WebSocket de Traccar cerrada --- Código: {close_status_code}, "
             f"Mensaje: {close_msg}"
         )
+        self._stop_heartbeat()  # MODIFICADO: Detener el heartbeat al cerrar la conexión
         if self._close_callback:
             self._close_callback(ws_app_instance, close_status_code, close_msg)
 
     def close_websocket(self):
-        """
-        Cierra la conexión WebSocket si está activa.
-        """
+        """Cierra la conexión WebSocket si está activa."""
         if self.ws_app:
             logger.info("Cerrando conexión WebSocket de Traccar explícitamente...")
             try:
+                # El cierre de ws_app llamará a _on_close_ws, que detendrá el heartbeat.
                 self.ws_app.close()
             except Exception as e:
                 logger.error(f"Error durante cierre explícito de WebSocket: {e}")
             finally:
-                self.ws_app = None  # Aseguramos que se establezca a None
+                self.ws_app = None
         else:
             logger.info("No hay conexión WebSocket de Traccar activa para cerrar.")
