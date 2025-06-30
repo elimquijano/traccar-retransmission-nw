@@ -1,6 +1,5 @@
 import asyncio
 import uvloop
-
 uvloop.install()
 import logging
 import threading
@@ -8,11 +7,7 @@ import signal
 import os
 
 # Importamos la configuración del logging
-from app.logger_setup import (
-    setup_logging,
-    start_log_rotation_thread,
-    stop_log_rotation_thread,
-)
+from app.logger_setup import setup_logging, start_log_rotation_thread, stop_log_rotation_thread
 
 # Configuramos el logging
 logger = setup_logging()
@@ -137,9 +132,8 @@ async def run_application_async(loop: asyncio.AbstractEventLoop):
             and not traccar_logic_thread_stop_event.is_set()
         ):
             try:
-                # --- CORRECCIÓN AQUÍ ---
-                # Se verifica traccar_cli._session.cookies en lugar de traccar_cli.session_cookies
-                if not traccar_cli._session.cookies:
+                # Intentamos login si no hay cookies de sesión
+                if not traccar_cli.session_cookies:
                     logger.info("Intentando login en Traccar (desde hilo síncrono)...")
                     if not traccar_cli.login():
                         logger.error(
@@ -152,7 +146,7 @@ async def run_application_async(loop: asyncio.AbstractEventLoop):
                             break  # Salimos si se solicita parada
                         continue
 
-                # El resto de la lógica permanece igual
+                # Obtenemos dispositivos si la caché está vacía
                 if not traccar_cli.traccar_devices_cache:
                     logger.info(
                         "Obteniendo dispositivos de Traccar (desde hilo síncrono)..."
@@ -168,6 +162,7 @@ async def run_application_async(loop: asyncio.AbstractEventLoop):
                             break
                         continue
 
+                # Cargamos configuraciones de retransmisión si no están cargadas
                 if not retransmission_mgr.retransmission_configs_db1:
                     logger.info(
                         "Cargando configuraciones de retransmisión desde BD (desde hilo síncrono)..."
@@ -188,11 +183,13 @@ async def run_application_async(loop: asyncio.AbstractEventLoop):
                             break
                         continue
 
+                # Intentamos conexión WebSocket
                 logger.info(
                     "Intentando conexión WebSocket de Traccar (desde hilo síncrono)..."
                 )
                 traccar_cli.connect_websocket()
 
+                # Verificamos si se solicitó parada
                 if (
                     global_shutdown_event.is_set()
                     or traccar_logic_thread_stop_event.is_set()
@@ -272,7 +269,7 @@ async def run_application_async(loop: asyncio.AbstractEventLoop):
             logger.info(
                 "Secuencia de apagado de LogWriterDB completada por la aplicación principal."
             )
-
+        
         stop_log_rotation_thread()
         logger.info(
             "Todos los servicios de la aplicación han sido señalizados para detenerse o han completado su apagado."
