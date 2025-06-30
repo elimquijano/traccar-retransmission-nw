@@ -152,43 +152,6 @@ class TraccarClient:
                 f"{updated_count} dispositivos actualizados en caché desde WebSocket."
             )
 
-    # NUEVO: Métodos para controlar el heartbeat
-    def _start_heartbeat(self):
-        """Inicia un hilo que envía un mensaje periódico para mantener la conexión activa."""
-        self.heartbeat_stop_event.clear()
-
-        def heartbeat_loop():
-            logger.info("Hilo de heartbeat iniciado.")
-            while not self.heartbeat_stop_event.wait(
-                30
-            ):  # Envía un mensaje cada 30 segundos
-                if self.ws_app and self.ws_app.sock and self.ws_app.sock.connected:
-                    try:
-                        # Enviamos un JSON vacío. El servidor lo interpreta como actividad.
-                        self.ws_app.send("{}")
-                        logger.debug("Heartbeat de aplicación enviado al WebSocket.")
-                    except Exception as e:
-                        logger.error(f"Error al enviar heartbeat de aplicación: {e}")
-                        break  # Salir del bucle si hay un error
-                else:
-                    logger.warning(
-                        "Socket no conectado, deteniendo bucle de heartbeat."
-                    )
-                    break
-            logger.info("Hilo de heartbeat detenido.")
-
-        self.heartbeat_thread = threading.Thread(
-            target=heartbeat_loop, name="WsHeartbeatThread", daemon=True
-        )
-        self.heartbeat_thread.start()
-
-    def _stop_heartbeat(self):
-        """Detiene el hilo de heartbeat de forma segura."""
-        self.heartbeat_stop_event.set()
-        if self.heartbeat_thread and self.heartbeat_thread.is_alive():
-            self.heartbeat_thread.join(timeout=2)
-            self.heartbeat_thread = None
-
     def connect_websocket(self):
         """
         Conecta al API WebSocket de Traccar. Esta llamada es bloqueante (run_forever).
